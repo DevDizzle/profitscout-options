@@ -1,23 +1,13 @@
 # serving/core/gcs.py
 import logging
 import json
+from datetime import date
 from google.cloud import storage
+from google.cloud.storage import Blob
 from . import config
 
 def _client() -> storage.Client:
     return storage.Client()
-
-def list_blobs_with_content(bucket_name: str, prefix: str) -> dict:
-    client = _client()
-    blobs = client.list_blobs(bucket_name, prefix=prefix)
-    content_map = {}
-    for blob in blobs:
-        try:
-            content = blob.download_as_text()
-            content_map[blob.name] = content
-        except Exception as e:
-            logging.error(f"Failed to read blob {blob.name}: {e}")
-    return content_map
 
 def list_blobs(bucket_name: str, prefix: str | None = None) -> list[str]:
     """Lists all the blob names in a GCS bucket with a given prefix."""
@@ -35,30 +25,15 @@ def read_blob(bucket_name: str, blob_name: str, encoding: str = "utf-8") -> str 
         return None
 
 def write_text(bucket_name: str, blob_name: str, data: str, content_type: str = "text/plain"):
+    """Writes a string to a GCS blob."""
     try:
         _client().bucket(bucket_name).blob(blob_name).upload_from_string(data, content_type)
     except Exception as e:
         logging.error(f"Failed to write to blob {blob_name}: {e}")
         raise
 
-def delete_blob(bucket_name: str, blob_name: str):
-    """Deletes a blob from GCS."""
-    try:
-        _client().bucket(bucket_name).blob(blob_name).delete()
-        logging.info(f"Successfully deleted {blob_name}")
-    except Exception as e:
-        logging.error(f"Failed to delete blob {blob_name}: {e}")
-        raise
-
-def cleanup_old_files(bucket_name: str, folder: str, ticker: str, keep_filename: str):
-    bucket = _client().bucket(bucket_name)
-    prefix = f"{folder}{ticker}_"
-    blobs_to_delete = [b for b in bucket.list_blobs(prefix=prefix) if b.name != keep_filename]
-    for blob in blobs_to_delete:
-        logging.info(f"[{ticker}] Deleting old file: {blob.name}")
-        blob.delete()
-
 def get_tickers() -> list[str]:
+    """Loads the official ticker list from the GCS bucket."""
     try:
         bucket = _client().bucket(config.GCS_BUCKET_NAME)
         blob = bucket.blob(config.TICKER_LIST_PATH)
@@ -68,18 +43,34 @@ def get_tickers() -> list[str]:
         logging.error(f"Failed to load tickers from GCS: {e}")
         return []
 
-def delete_folder_contents(bucket_name: str, prefix: str):
-    """Deletes all blobs within a specified folder (prefix) in a GCS bucket."""
+def upload_from_filename(bucket_name: str, source_file_path: str, destination_blob_name: str) -> str | None:
+    """Uploads a local file to GCS and returns its GCS URI."""
+    try:
+        client = _client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(destination_blob_name)
+        blob.upload_from_filename(source_file_path, content_type="image/png")
+        return f"gs://{bucket_name}/{destination_blob_name}"
+    except Exception as e:
+        logging.error(f"Failed to upload {source_file_path} to GCS: {e}", exc_info=True)
+        return None
+
+def get_latest_blob_for_ticker(bucket_name: str, prefix: str, ticker: str) -> Blob | None:
+    """Finds the most recent blob for a ticker in a given folder."""
     client = _client()
-    bucket = client.bucket(bucket_name)
-    blobs = bucket.list_blobs(prefix=prefix)
+    blobs = client.list_blobs(bucket_name, prefix=f"{prefix}{ticker}_")
     
-    deleted_count = 0
+    latest_blob = None
+    latest_date = None
+
     for blob in blobs:
-        blob.delete()
-        deleted_count += 1
-    
-    if deleted_count > 0:
-        logging.info(f"Deleted {deleted_count} old files from gs://{bucket_name}/{prefix}")
-    else:
-        logging.info(f"No old files found in gs://{bucket_name}/{prefix} to delete.")
+        try:
+            date_str = blob.name.split('_')[-1].split('.')[0]
+            blob_date = date.fromisoformat(date_str)
+            if latest_date is None or blob_date > latest_date:
+                latest_date = blob_date
+                latest_blob = blob
+        except (ValueError, IndexError):
+            continue
+            
+    return latest_blob

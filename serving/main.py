@@ -3,16 +3,24 @@ import functions_framework
 import logging
 from core.pipelines import (
     page_generator,
-    options_recommendation_generator as options_reco_gen,
+    chart_generator,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 @functions_framework.http
-def run_options_recommendation_generator(request):
+def run_page_generator(request):
     """
-    Entry point for the options recommendations markdown generator.
-    Reads options_candidates and writes MD files to GCS (options-recommendations/).
+    Finds recommendation files that are missing a page and processes them.
     """
-    options_reco_gen.run_pipeline()
-    return "Options recommendation generator pipeline finished.", 200
+    page_generator.run_pipeline()
+    return "Page generator pipeline finished.", 200
+
+@functions_framework.http
+def run_chart_generator(request):
+    """
+    Entry point for the chart image generator pipeline.
+    """
+    # We call the main() function from the script to run the pipeline
+    chart_generator.main() 
+    return "Chart generator pipeline finished.", 200

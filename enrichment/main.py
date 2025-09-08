@@ -7,7 +7,6 @@ from core.pipelines import (
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# --- NEW: Options candidate selector (no LLM here) ---
 @functions_framework.http
 def run_options_candidate_selector(request):
     """Programmatic options top-5 CALL/PUT selector."""

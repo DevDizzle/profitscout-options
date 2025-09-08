@@ -35,13 +35,16 @@ SCORE_WEIGHTS = {
 # --- Recommendation Generator Pipeline ---
 RECOMMENDATION_PREFIX = "recommendations/"
 MAX_WORKERS_RECOMMENDER = 8
-PRICE_DATA_TABLE_ID = f"{SOURCE_PROJECT_ID}.profit_scout.price_data"  # For chart data
-CHART_GCS_FOLDER = "charts/"  # GCS folder for chart images
+PRICE_DATA_TABLE_ID = f"{SOURCE_PROJECT_ID}.profit_scout.price_data"
 SERVICE_ACCOUNT_EMAIL = os.environ.get("SERVICE_ACCOUNT_EMAIL")
+
+# --- Chart Generator ---
+# Note: The chart-generator.py script hardcodes subfolders.
+# This is a general prefix for organization.
+CHART_GCS_FOLDER = "charts/" 
 
 # --- Options Explainer (Serving) ---
 OPTIONS_CANDIDATES_TABLE_ID = f"{SOURCE_PROJECT_ID}.{BIGQUERY_DATASET}.options_candidates"
-# Markdown outputs for options notes will be written under this folder in GCS.
 OPTIONS_MD_PREFIX = os.environ.get("OPTIONS_MD_PREFIX", "options-recommendations/")
 
 # --- Page Generator Pipeline ---

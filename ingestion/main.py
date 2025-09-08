@@ -5,7 +5,7 @@ import functions_framework
 from google.cloud import bigquery
 
 from core import config
-from core.clients.polygon_client import PolygonClient
+from core.clients.polygon import PolygonClient
 from core.pipelines import options_chain_fetcher
 
 # --- Global Initialization (Shared Across Functions) ---
