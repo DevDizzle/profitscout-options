@@ -9,9 +9,30 @@ from core.pipelines import (
     data_bundler,
     recommendations_generator,
     sync_to_firestore,
+    data_cruncher, 
+    dashboard_generator, # <--- ADD THIS IMPORT
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# --- ADD THIS NEW FUNCTION ---
+@functions_framework.http
+def run_dashboard_generator(request):
+    """
+    Entry point for the dashboard JSON assembly pipeline.
+    """
+    dashboard_generator.run_pipeline()
+    return "Dashboard generator pipeline finished.", 200
+# -----------------------------
+
+@functions_framework.http
+def run_data_cruncher(request):
+    """
+    Entry point for the data cruncher (prep stage) pipeline.
+    Fetches raw data, calculates KPIs, and outputs a JSON file per ticker.
+    """
+    data_cruncher.run_pipeline()
+    return "Data cruncher pipeline finished.", 200
 
 @functions_framework.http
 def run_page_generator(request):
