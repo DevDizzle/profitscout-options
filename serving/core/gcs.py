@@ -43,13 +43,14 @@ def get_tickers() -> list[str]:
         logging.error(f"Failed to load tickers from GCS: {e}")
         return []
 
-def upload_from_filename(bucket_name: str, source_file_path: str, destination_blob_name: str) -> str | None:
+def upload_from_filename(bucket_name: str, source_file_path: str, destination_blob_name: str, content_type: str = "image/png") -> str | None:
     """Uploads a local file to GCS and returns its GCS URI."""
     try:
         client = _client()
         bucket = client.bucket(bucket_name)
         blob = bucket.blob(destination_blob_name)
-        blob.upload_from_filename(source_file_path, content_type="image/png")
+        # --- MODIFIED LINE ---
+        blob.upload_from_filename(source_file_path, content_type=content_type)
         return f"gs://{bucket_name}/{destination_blob_name}"
     except Exception as e:
         logging.error(f"Failed to upload {source_file_path} to GCS: {e}", exc_info=True)

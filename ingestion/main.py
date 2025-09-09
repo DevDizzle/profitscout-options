@@ -13,7 +13,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 bq_client = bigquery.Client(project=config.PROJECT_ID)
 
-# --- NEW: Options Chain (Polygon) HTTP entry point ---
 @functions_framework.http
 def fetch_options_chain(request):
     """
