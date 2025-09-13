@@ -72,7 +72,7 @@ Use the `recommendation` from the AI Score KPI to set the teaser signal:
     * For each chart key (`90dayPrice`, `revenueTrend`, `rsiMacd`), write a descriptive 20-40 word alt text. The text should describe what the chart shows and mention the ticker.
 
 6.  **Format**:
-    * Output **ONLY** the JSON object that matches the example structure exactly. Do not include any text, warnings, or markdown code blocks before or after the JSON.
+    * Output **ONLY** the JSON object that matches the example structure exactly.
 
 ### Input Data
 - **Ticker**: {ticker}
@@ -80,36 +80,33 @@ Use the `recommendation` from the AI Score KPI to set the teaser signal:
 - **Current Year**: {year}
 - **Key Performance Indicators (KPIs)**:
 {kpis_str}
-- **Business Profile Snippet**:
-{profile_snippet}
 
 ### Example Output (Return ONLY this JSON structure)
 {example_json}
 """
 
-
 # --- Helper Functions ---
 
-def _get_additional_data(ticker: str, business_profile_uri: str) -> Dict[str, Any]:
-    """Fetches business profile from GCS URI and company metadata from BigQuery."""
-    data = {"profile": None, "company_name": None, "sector": None, "industry": None}
-    
-    # 1. Fetch Business Profile from GCS using the provided URI
-    if business_profile_uri:
-        profile_json_str = gcs.read_blob(config.GCS_BUCKET_NAME, business_profile_uri.replace(f"gs://{config.GCS_BUCKET_NAME}/", ""))
-        if profile_json_str:
-            try:
-                profile_data = json.loads(profile_json_str)
-                full_text = profile_data.get("business_summary", "")
-                data["profile"] = {
-                    "fullText": full_text,
-                    "truncated": (full_text[:200] + '...') if len(full_text) > 200 else full_text,
-                    "tags": [] # Placeholder for future tag extraction
-                }
-            except json.JSONDecodeError:
-                logging.warning(f"[{ticker}] Failed to parse business profile JSON from {business_profile_uri}.")
+def _delete_old_dashboard_files(ticker: str):
+    """Deletes all dashboard JSON files for a given ticker."""
+    prefix = f"{OUTPUT_PREFIX}{ticker}_dashboard_"
+    blobs_to_delete = gcs.list_blobs(config.GCS_BUCKET_NAME, prefix)
+    for blob_name in blobs_to_delete:
+        try:
+            gcs.delete_blob(config.GCS_BUCKET_NAME, blob_name)
+        except Exception as e:
+            logging.error(f"[{ticker}] Failed to delete old dashboard file {blob_name}: {e}")
 
-    # 2. Fetch Company Metadata from BigQuery
+def _get_recommendation_and_metadata(ticker: str) -> Dict[str, Any]:
+    """Fetches the latest recommendation markdown and company metadata."""
+    data = {"recommendation_text": None, "company_name": None, "sector": None, "industry": None}
+    
+    latest_rec_blob = gcs.get_latest_blob_for_ticker(config.GCS_BUCKET_NAME, config.RECOMMENDATION_PREFIX, ticker)
+    if latest_rec_blob:
+        data["recommendation_text"] = latest_rec_blob.download_as_text()
+    else:
+        logging.warning(f"[{ticker}] No recommendation markdown file found.")
+
     client = bigquery.Client(project=config.SOURCE_PROJECT_ID)
     query = f"""
         SELECT company_name, sector, industry
@@ -127,7 +124,6 @@ def _get_additional_data(ticker: str, business_profile_uri: str) -> Dict[str, An
 
     return data
 
-
 def _infer_related_stocks(ticker: str, industry: str) -> List[str]:
     """Queries BQ for up to 3 other tickers in the same industry."""
     if not industry:
@@ -138,7 +134,6 @@ def _infer_related_stocks(ticker: str, industry: str) -> List[str]:
         FROM `{config.BUNDLER_STOCK_METADATA_TABLE_ID}`
         WHERE industry = @industry AND ticker != @ticker
         GROUP BY ticker
-        ORDER BY MAX(market_cap) DESC -- Order by market cap to get relevant peers
         LIMIT 3
     """
     job_config = bigquery.QueryJobConfig(
@@ -149,7 +144,6 @@ def _infer_related_stocks(ticker: str, industry: str) -> List[str]:
     )
     df = client.query(query, job_config=job_config).to_dataframe()
     return df["ticker"].tolist()
-
 
 # --- Main Worker and Pipeline ---
 
@@ -166,45 +160,35 @@ def process_ticker(prep_blob_name: str) -> Optional[str]:
     logging.info(f"[{ticker}] Starting dashboard generation for {run_date_str}...")
 
     try:
-        # 1. Load Prep Data from GCS
         prep_json_str = gcs.read_blob(config.GCS_BUCKET_NAME, prep_blob_name)
         if not prep_json_str:
             logging.warning(f"[{ticker}] Prep JSON not found or empty at {prep_blob_name}.")
             return None
         prep_data = json.loads(prep_json_str)
 
-        # 2. Fetch Additional Data (Profile, Company Name, etc.)
-        additional_data = _get_additional_data(ticker, prep_data.get("businessProfileUri"))
-        company_name = additional_data.get("company_name", ticker)
+        metadata = _get_recommendation_and_metadata(ticker)
+        company_name = metadata.get("company_name", ticker)
         
-        # 3. Infer Related Stocks
-        related_stocks = _infer_related_stocks(ticker, additional_data.get("industry"))
+        related_stocks = _infer_related_stocks(ticker, metadata.get("industry"))
         
-        # 4. Generate Content with LLM
         prompt = _PROMPT_TEMPLATE.format(
             ticker=ticker,
             company_name=company_name,
             year=run_date.year,
             kpis_str=json.dumps(prep_data.get("kpis"), indent=2),
-            profile_snippet=additional_data.get("profile", {}).get("truncated", ""),
             example_json=_EXAMPLE_JSON_FOR_LLM
         )
         
         llm_response_str = vertex_ai.generate(prompt)
-        # Strip markdown and parse JSON; fallback to empty dict
         if llm_response_str.strip().startswith("```json"):
             llm_response_str = re.search(r'\{.*\}', llm_response_str, re.DOTALL).group(0)
         llm_data = json.loads(llm_response_str)
 
-        # 5. Assemble Final Dashboard JSON
         final_dashboard = {
             "ticker": ticker, "runDate": run_date_str,
-            "titleInfo": {
-                "companyName": company_name, "ticker": ticker,
-                "asOfDate": run_date_str,
-            },
+            "titleInfo": { "companyName": company_name, "ticker": ticker, "asOfDate": run_date_str },
             "kpis": prep_data.get("kpis"),
-            "profile": additional_data.get("profile"),
+            "aiAnalystRecommendation": { "title": "AI Analyst Recommendation", "markdownContent": metadata.get("recommendation_text") },
             "charts": {
                 key: {"uri": uri, "alt": llm_data.get("altText", {}).get(key, f"Chart for {key} for {ticker}")}
                 for key, uri in prep_data.get("chartUris", {}).items()
@@ -212,11 +196,10 @@ def process_ticker(prep_blob_name: str) -> Optional[str]:
             "seo": llm_data.get("seo"),
             "teaser": llm_data.get("teaser"),
             "relatedStocks": related_stocks,
-            "calendar": {}, # Placeholder, to be handled by backend
-            "options": {}, # Placeholder, to be handled by backend
+            "calendar": {}, "options": {},
         }
         
-        # 6. Upload Final JSON to GCS
+        _delete_old_dashboard_files(ticker)
         output_blob_name = f"{OUTPUT_PREFIX}{ticker}_dashboard_{run_date_str}.json"
         gcs.write_text(config.GCS_BUCKET_NAME, output_blob_name, json.dumps(final_dashboard, indent=2), "application/json")
         logging.info(f"[{ticker}] Successfully generated and uploaded dashboard JSON to {output_blob_name}")
@@ -235,7 +218,6 @@ def run_pipeline():
     
     work_items = []
     for prep_path in all_prep_files:
-        # Construct expected dashboard path from prep path
         expected_dashboard_path = prep_path.replace(PREP_PREFIX, OUTPUT_PREFIX).replace(".json", "_dashboard.json")
         if expected_dashboard_path not in all_dashboard_files:
             work_items.append(prep_path)
@@ -256,7 +238,6 @@ def run_pipeline():
                 logging.error(f"Item {future_to_item[future]} generated an unhandled exception: {exc}", exc_info=True)
     
     logging.info(f"--- Dashboard Generation Pipeline Finished. Processed {processed_count} of {len(work_items)} new dashboards. ---")
-
 
 if __name__ == "__main__":
     run_pipeline()

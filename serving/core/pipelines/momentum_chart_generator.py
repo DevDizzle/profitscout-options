@@ -12,7 +12,6 @@ import threading
 
 from google.cloud import storage
 
-# Matplotlib: use non-interactive backend and avoid global state in threads
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -26,18 +25,15 @@ MOMENTUM_CHART_FOLDER = "Momentum-Chart/"
 TECHNICALS_FOLDER = "technicals/"
 TICKER_LIST_PATH = "tickerlist.txt"
 
-# Matplotlib is not thread-safe; keep a lock (harmless redundancy with single plotter)
 _PLOT_LOCK = threading.Lock()
-
-# Single-threaded plot queue: only the plotter thread may call Matplotlib
 PLOT_QUEUE: "Queue[tuple[callable, tuple, dict]]" = Queue()
 
 
 def _plotter():
-    """Dedicated plotter thread: serializes all Matplotlib access."""
+    """Dedicated plotter thread."""
     while True:
         task = PLOT_QUEUE.get()
-        if task is None:  # shutdown sentinel
+        if task is None:
             PLOT_QUEUE.task_done()
             break
         func, args, kwargs = task
@@ -50,20 +46,27 @@ def _plotter():
 
 
 def _enqueue_plot(func, *args, **kwargs):
-    """Enqueue a plotting task to be executed by the plotter thread."""
+    """Enqueue a plotting task."""
     PLOT_QUEUE.put((func, args, kwargs))
 
+def _delete_old_momentum_charts(ticker: str):
+    """Deletes all previous momentum chart images for a given ticker."""
+    prefix = f"{MOMENTUM_CHART_FOLDER}{ticker}_"
+    blobs_to_delete = gcs.list_blobs(config.GCS_BUCKET_NAME, prefix)
+    for blob_name in blobs_to_delete:
+        try:
+            gcs.delete_blob(config.GCS_BUCKET_NAME, blob_name)
+        except Exception as e:
+            logging.error(f"[{ticker}] Failed to delete old momentum chart {blob_name}: {e}")
 
 def _generate_momentum_chart(ticker: str, technicals_data: dict) -> str | None:
     """Generates a 90-day momentum (RSI/MACD) chart and uploads it to GCS."""
     timeseries = technicals_data.get("technicals_timeseries", [])
     if not timeseries:
-        logging.warning(f"[{ticker}] No technical timeseries data found.")
         return None
 
     df = pd.DataFrame(timeseries).copy()
     if "date" not in df.columns:
-        logging.warning(f"[{ticker}] 'date' missing in technicals timeseries.")
         return None
 
     df['date'] = pd.to_datetime(df['date'], errors="coerce")
@@ -72,7 +75,6 @@ def _generate_momentum_chart(ticker: str, technicals_data: dict) -> str | None:
         return None
 
     today_str = date.today().strftime('%Y-%m-%d')
-    # --- MODIFICATION 1: Change file extension ---
     local_file_path = f"{ticker}_momentum_chart_{today_str}.webp"
 
     with _PLOT_LOCK:
@@ -92,8 +94,6 @@ def _generate_momentum_chart(ticker: str, technicals_data: dict) -> str | None:
                 ax1.tick_params(axis='y', labelcolor=text_color)
                 ax1.grid(True, linestyle="--", alpha=0.15)
                 ax1.set_title(f"{ticker} — 90-Day Momentum Indicators", color=text_color, fontsize=14, pad=12)
-            else:
-                ax1.text(0.5, 0.5, "RSI_14 not available", color=text_color, ha="center", va="center", transform=ax1.transAxes)
 
             have_hist = 'MACDh_12_26_9' in df.columns
             have_macd = 'MACD_12_26_9' in df.columns
@@ -111,19 +111,16 @@ def _generate_momentum_chart(ticker: str, technicals_data: dict) -> str | None:
             ax2.tick_params(axis='x', labelcolor=text_color, rotation=45)
             ax2.tick_params(axis='y', labelcolor=text_color)
             ax2.grid(True, linestyle="--", alpha=0.15)
-
             fig.legend(loc='lower center', ncol=4, bbox_to_anchor=(0.5, -0.05), frameon=False, labelcolor=text_color)
             plt.tight_layout(rect=[0, 0, 1, 0.98])
             fig.subplots_adjust(bottom=0.2)
-            # --- MODIFICATION 2: Change save format ---
             fig.savefig(local_file_path, format="webp", bbox_inches="tight")
         finally:
             plt.close(fig)
 
     try:
-        # --- MODIFICATION 3: Change blob name extension ---
+        _delete_old_momentum_charts(ticker)
         blob_name = f"{MOMENTUM_CHART_FOLDER}{ticker}_{today_str}.webp"
-        # --- MODIFICATION 4: Add content_type parameter ---
         gcs_uri = gcs.upload_from_filename(config.GCS_BUCKET_NAME, local_file_path, blob_name, content_type="image/webp")
         if gcs_uri:
             logging.info(f"[{ticker}] Successfully uploaded momentum chart to {gcs_uri}")
@@ -132,12 +129,8 @@ def _generate_momentum_chart(ticker: str, technicals_data: dict) -> str | None:
         if os.path.exists(local_file_path):
             os.remove(local_file_path)
 
-
 def process_ticker(ticker: str):
-    """Worker: prepare data & enqueue plotting tasks. No Matplotlib calls here."""
-    logging.info(f"--- Processing momentum chart for {ticker} ---")
-
-    # This new code directly looks up the exact blob name
+    """Worker: prepare data & enqueue plotting tasks."""
     storage_client = storage.Client()
     bucket = storage_client.bucket(config.GCS_BUCKET_NAME)
     blob_name = f"{TECHNICALS_FOLDER}{ticker}_technicals.json"
@@ -150,27 +143,20 @@ def process_ticker(ticker: str):
         except Exception as e:
             logging.error(f"[{ticker}] Failed to process technicals file: {e}")
     else:
-        logging.warning(f"[{ticker}] No technicals file found at '{blob_name}'. Skipping momentum chart.")
-
+        logging.warning(f"[{ticker}] No technicals file found at '{blob_name}'.")
     return ticker
 
-
 def run_pipeline():
-    """Orchestrate momentum chart generation with concurrent data prep + single-thread plotting."""
+    """Orchestrate momentum chart generation."""
     logging.info("--- Starting Momentum Chart Generation Script ---")
-
     tickers = gcs.get_tickers()
     if not tickers:
-        logging.critical("No tickers loaded from GCS. Exiting.")
+        logging.critical("No tickers loaded. Exiting.")
         return
 
-    logging.info(f"Found {len(tickers)} tickers to process.")
-
-    # Start dedicated plotter thread
     plot_thread = threading.Thread(target=_plotter, name="PlotterThread", daemon=True)
     plot_thread.start()
 
-    # Prepare per-ticker work concurrently; enqueue plot tasks to the plotter
     count = 0
     with ThreadPoolExecutor(max_workers=8) as executor:
         futures = {executor.submit(process_ticker, t): t for t in tickers}
@@ -182,13 +168,7 @@ def run_pipeline():
             except Exception as e:
                 logging.exception(f"[{t}] Unhandled error in worker: {e}")
 
-    # Drain the plotting queue and cleanly stop the plotter
     PLOT_QUEUE.join()
     PLOT_QUEUE.put(None)
     plot_thread.join()
-
     logging.info(f"--- Momentum Chart Generation Finished. Processed {count} of {len(tickers)} tickers. ---")
-
-
-if __name__ == "__main__":
-    run_pipeline()

@@ -1,11 +1,12 @@
 # serving/core/pipelines/data_bundler.py
 import logging
 import pandas as pd
+import json
 from collections import defaultdict
 from typing import Any, Dict, List
 from google.cloud import bigquery, storage
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from .. import config, bq
+from .. import config, bq, gcs
 
 def _copy_blob(blob, source_bucket, destination_bucket, overwrite: bool = False):
     """
@@ -41,11 +42,11 @@ def _sync_gcs_data():
     source_bucket = storage_client.bucket(config.GCS_BUCKET_NAME, user_project=config.SOURCE_PROJECT_ID)
     destination_bucket = storage_client.bucket(config.DESTINATION_GCS_BUCKET_NAME, user_project=config.DESTINATION_PROJECT_ID)
     
-    # --- THIS IS THE MODIFIED SECTION ---
     prefixes_to_sync = [
+        "90-Day-Chart/", "Revenue-Chart/", "Momentum-Chart/", # <-- ADDED CHART FOLDERS
         "sec-business/", "headline-news/", "sec-mda/",
         "financial-statements/", "earnings-call-transcripts/",
-        "recommendations/", "pages/",
+        "recommendations/", "pages/", "dashboards/", "images/",
         "fundamentals-analysis/"
     ]
     prefixes_to_overwrite = ["technicals/"]
@@ -83,7 +84,8 @@ def _get_latest_daily_files_map() -> Dict[str, Dict[str, str]]:
     daily_prefixes = {
         "news": "headline-news/",
         "recommendation_analysis": "recommendations/",
-        "pages_json": "pages/"
+        "pages_json": "pages/",
+        "dashboard_json": "dashboards/"
     }
     latest_files = defaultdict(dict)
     
@@ -101,6 +103,32 @@ def _get_latest_daily_files_map() -> Dict[str, Dict[str, str]]:
             latest_files[ticker][key] = f"gs://{config.DESTINATION_GCS_BUCKET_NAME}/{latest_name}"
             
     return latest_files
+
+def _get_latest_kpis() -> Dict[str, Dict[str, Any]]:
+    """Reads all recent prep files to get the latest price and 30-day change for each ticker."""
+    blobs = gcs.list_blobs(config.GCS_BUCKET_NAME, prefix="prep/")
+    latest_kpis = {}
+    
+    for blob_name in blobs:
+        try:
+            content = gcs.read_blob(config.GCS_BUCKET_NAME, blob_name)
+            if not content: continue
+            data = json.loads(content)
+            ticker = data.get("ticker")
+            if not ticker: continue
+            
+            # Use this data if it's the first time we see this ticker or if it's a more recent runDate
+            if ticker not in latest_kpis or data.get("runDate") > latest_kpis[ticker].get("runDate"):
+                latest_kpis[ticker] = {
+                    "price": data.get("kpis", {}).get("price", {}).get("value"),
+                    "thirty_day_change_pct": data.get("kpis", {}).get("thirtyDayChange", {}).get("value"),
+                    "runDate": data.get("runDate")
+                }
+        except (json.JSONDecodeError, KeyError) as e:
+            logging.warning(f"Could not process KPI file {blob_name}: {e}")
+            continue
+            
+    return latest_kpis
 
 def _get_ticker_work_list() -> pd.DataFrame:
     """Gets the base metadata for the latest quarter for each ticker."""
@@ -127,8 +155,8 @@ def _get_weighted_scores() -> pd.DataFrame:
     """
     return client.query(query).to_dataframe()
 
-def _assemble_final_metadata(work_list_df: pd.DataFrame, scores_df: pd.DataFrame, daily_files_map: Dict) -> List[Dict[str, Any]]:
-    """Joins metadata and adds GCS asset URIs using the pre-built file map."""
+def _assemble_final_metadata(work_list_df: pd.DataFrame, scores_df: pd.DataFrame, daily_files_map: Dict, kpis_map: Dict) -> List[Dict[str, Any]]:
+    """Joins metadata and adds GCS asset URIs and KPIs."""
     if scores_df.empty: return []
     merged_df = pd.merge(work_list_df, scores_df, on="ticker", how="inner")
     final_records = []
@@ -138,18 +166,29 @@ def _assemble_final_metadata(work_list_df: pd.DataFrame, scores_df: pd.DataFrame
         quarterly_date_str = row["quarter_end_date"].strftime('%Y-%m-%d')
         record = row.to_dict()
 
+        # Add daily URIs
         record["news"] = daily_files_map.get(ticker, {}).get("news")
         record["recommendation_analysis"] = daily_files_map.get(ticker, {}).get("recommendation_analysis")
         record["pages_json"] = daily_files_map.get(ticker, {}).get("pages_json")
+        record["dashboard_json"] = daily_files_map.get(ticker, {}).get("dashboard_json")
         
-        # --- THIS IS THE MODIFIED SECTION ---
+        # Add quarterly URIs
         record["technicals"] = f"gs://{config.DESTINATION_GCS_BUCKET_NAME}/technicals/{ticker}_technicals.json"
         record["profile"] = f"gs://{config.DESTINATION_GCS_BUCKET_NAME}/sec-business/{ticker}_{quarterly_date_str}.json"
         record["mda"] = f"gs://{config.DESTINATION_GCS_BUCKET_NAME}/sec-mda/{ticker}_{quarterly_date_str}.json"
         record["financials"] = f"gs://{config.DESTINATION_GCS_BUCKET_NAME}/financial-statements/{ticker}_{quarterly_date_str}.json"
         record["earnings_transcript"] = f"gs://{config.DESTINATION_GCS_BUCKET_NAME}/earnings-call-transcripts/{ticker}_{quarterly_date_str}.json"
-        record["fundamentals"] = f"gs://{config.DESTINATION_GCS_BUCKET_NAME}/fundamentals-analysis/{ticker}_{quarterly_date_str}.json" # <-- ADDED
+        record["fundamentals"] = f"gs://{config.DESTINATION_GCS_BUCKET_NAME}/fundamentals-analysis/{ticker}_{quarterly_date_str}.json"
+        
+        # Add Image URI
+        record["image_uri"] = f"gs://{config.DESTINATION_GCS_BUCKET_NAME}/images/{ticker}.png"
 
+        # Add latest KPIs
+        ticker_kpis = kpis_map.get(ticker, {})
+        record["price"] = ticker_kpis.get("price")
+        record["thirty_day_change_pct"] = ticker_kpis.get("thirty_day_change_pct")
+
+        # Determine recommendation
         weighted_score = row["weighted_score"]
         if weighted_score > 0.62: record["recommendation"] = "BUY"
         elif weighted_score >= 0.43: record["recommendation"] = "HOLD"
@@ -164,6 +203,7 @@ def run_pipeline():
     
     _sync_gcs_data()
     daily_files_map = _get_latest_daily_files_map()
+    kpis_map = _get_latest_kpis()
     
     work_list_df = _get_ticker_work_list()
     if work_list_df.empty:
@@ -171,7 +211,7 @@ def run_pipeline():
         return
         
     scores_df = _get_weighted_scores()
-    final_metadata = _assemble_final_metadata(work_list_df, scores_df, daily_files_map)
+    final_metadata = _assemble_final_metadata(work_list_df, scores_df, daily_files_map, kpis_map)
     
     if not final_metadata:
         logging.warning("No complete records to load to BigQuery.")

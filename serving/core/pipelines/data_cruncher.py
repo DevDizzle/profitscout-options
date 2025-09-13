@@ -12,9 +12,9 @@ from .. import config, gcs
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s")
 OUTPUT_PREFIX = "prep/"
-MAX_WORKERS = 16 # Using a higher worker count for I/O bound tasks
+MAX_WORKERS = 16
 
-# --- Helper Functions for Data Aggregation (Run Once) ---
+# --- Helper Functions ---
 
 def _get_work_list() -> pd.DataFrame:
     """Queries stock_metadata for the list of tickers, industry, sector, and their latest quarter."""
@@ -31,18 +31,13 @@ def _get_work_list() -> pd.DataFrame:
     return df
 
 def _calculate_industry_averages(work_list_df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
-    """
-    Calculates industry-level average KPIs.
-    - 30-Day Price Change is calculated efficiently via a BigQuery aggregation.
-    - EPS Growth is calculated by reading individual GCS files (slower path).
-    """
+    """Calculates industry-level average KPIs."""
     logging.info("Calculating industry-level average KPIs...")
     if work_list_df.empty:
         return {}
 
     client = bigquery.Client(project=config.SOURCE_PROJECT_ID)
     
-    # 1. Calculate 30-Day Price Change average by INDUSTRY using BQ
     price_query = f"""
         WITH PriceChanges AS (
             SELECT
@@ -69,12 +64,8 @@ def _calculate_industry_averages(work_list_df: pd.DataFrame) -> Dict[str, Dict[s
     """
     price_change_df = client.query(price_query).to_dataframe()
     industry_price_change_avg = price_change_df.set_index('industry')['avg_change_pct_30d'].to_dict()
-    logging.info(f"Calculated average 30-day price change for {len(industry_price_change_avg)} industries.")
 
-    # 2. Re-enabled: Calculate EPS Growth by INDUSTRY (reading GCS files)
-    logging.info("Calculating industry average EPS Growth from GCS files (this may be slow)...")
     all_eps_growth = []
-    # Use a ThreadPoolExecutor to speed up GCS reads
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_row = {
             executor.submit(gcs.read_blob, config.GCS_BUCKET_NAME, f"financial-statements/{row['ticker']}_{row['latest_quarter'].strftime('%Y-%m-%d')}.json"): row
@@ -101,13 +92,9 @@ def _calculate_industry_averages(work_list_df: pd.DataFrame) -> Dict[str, Dict[s
     if all_eps_growth:
         eps_growth_df = pd.DataFrame(all_eps_growth)
         industry_eps_growth_avg = eps_growth_df.groupby('industry')['eps_qoq'].mean().to_dict()
-        logging.info(f"Calculated average QoQ EPS growth for {len(industry_eps_growth_avg)} industries.")
     else:
         industry_eps_growth_avg = {}
-        logging.warning("Could not calculate any EPS growth averages from GCS files.")
 
-
-    # 3. Combine results
     industry_averages = {}
     all_industries = set(industry_price_change_avg.keys()) | set(industry_eps_growth_avg.keys())
     for industry in all_industries:
@@ -117,26 +104,30 @@ def _calculate_industry_averages(work_list_df: pd.DataFrame) -> Dict[str, Dict[s
         }
     return industry_averages
 
-
-# --- Main Worker Function ---
+def _delete_old_prep_files(ticker: str):
+    """Deletes all prep JSON files for a given ticker."""
+    prefix = f"{OUTPUT_PREFIX}{ticker}_"
+    blobs_to_delete = gcs.list_blobs(config.GCS_BUCKET_NAME, prefix)
+    for blob_name in blobs_to_delete:
+        try:
+            gcs.delete_blob(config.GCS_BUCKET_NAME, blob_name)
+        except Exception as e:
+            logging.error(f"[{ticker}] Failed to delete old prep file {blob_name}: {e}")
 
 def _fetch_and_calculate_kpis(ticker: str, latest_quarter: date, industry: str, industry_averages: Dict) -> Optional[str]:
     """
-    Fetches all data for a single ticker, calculates KPIs vs Industry, and returns the generated JSON file path.
+    Fetches all data for a single ticker, calculates KPIs, and returns the generated JSON file path.
     """
-    logging.info(f"[{ticker}] Starting KPI calculation...")
     client = bigquery.Client(project=config.SOURCE_PROJECT_ID)
     run_date = date.today()
     run_date_str = run_date.strftime('%Y-%m-%d')
     
     final_json = {
         "ticker": ticker, "runDate": run_date_str, "kpis": {},
-        "chartUris": {}, "businessProfileUri": None
+        "chartUris": {}, "aiAnalystRecommendationUri": None
     }
 
     try:
-        # 1. Price KPIs
-        # (This part of the logic remains unchanged)
         price_query = f"SELECT date, adj_close FROM `{config.PRICE_DATA_TABLE_ID}` WHERE ticker = @ticker AND date <= @run_date ORDER BY date DESC LIMIT 31"
         job_config = bigquery.QueryJobConfig(query_parameters=[bigquery.ScalarQueryParameter("ticker", "STRING", ticker), bigquery.ScalarQueryParameter("run_date", "DATE", run_date)])
         price_df = client.query(price_query, job_config=job_config).to_dataframe()
@@ -146,13 +137,10 @@ def _fetch_and_calculate_kpis(ticker: str, latest_quarter: date, industry: str, 
             daily_change = (latest_close - prev_close) / prev_close * 100 if prev_close and prev_close != 0 else 0.0
             close_30d_ago = price_df['adj_close'].iloc[-1] if len(price_df) >= 30 else None
             change_30d = (latest_close - close_30d_ago) / close_30d_ago * 100 if close_30d_ago and close_30d_ago != 0 else 0.0
-            
             industry_avg_30d = industry_averages.get(industry, {}).get("avg_change_pct_30d")
-            
             final_json["kpis"]["price"] = {"value": round(latest_close, 2), "dailyChangePct": round(daily_change, 2), "signal": "positive" if daily_change > 0 else "negative"}
             final_json["kpis"]["thirtyDayChange"] = {"value": round(change_30d, 2), "vsIndustry": round(industry_avg_30d, 2) if pd.notna(industry_avg_30d) else "unavailable", "signal": "outperform" if pd.notna(industry_avg_30d) and change_30d > industry_avg_30d else "underperform"}
 
-        # 2. Revenue & EPS KPIs (from GCS)
         financials_blob_name = f"financial-statements/{ticker}_{latest_quarter.strftime('%Y-%m-%d')}.json"
         json_content = gcs.read_blob(config.GCS_BUCKET_NAME, financials_blob_name)
         if json_content:
@@ -163,17 +151,14 @@ def _fetch_and_calculate_kpis(ticker: str, latest_quarter: date, industry: str, 
                 prev_rev = reports[1].get("income_statement", {}).get("revenue")
                 latest_eps = reports[0].get("income_statement", {}).get("eps")
                 prev_eps = reports[1].get("income_statement", {}).get("eps")
-
                 if latest_rev is not None and prev_rev is not None and prev_rev != 0:
                     rev_qoq = (latest_rev - prev_rev) / abs(prev_rev) * 100
                     final_json["kpis"]["revenueQoQ"] = {"value": round(rev_qoq, 2), "signal": "strong" if rev_qoq > 5 else "weak" if rev_qoq < 0 else "moderate"}
-                
                 if latest_eps is not None and prev_eps is not None and prev_eps != 0:
                     eps_qoq = (latest_eps - prev_eps) / abs(prev_eps) * 100
                     industry_avg_eps = industry_averages.get(industry, {}).get("avg_eps_qoq")
                     final_json["kpis"]["epsGrowth"] = {"value": round(eps_qoq, 2), "vsIndustry": round(industry_avg_eps, 2) if pd.notna(industry_avg_eps) else "unavailable", "signal": "outperform" if pd.notna(industry_avg_eps) and eps_qoq > industry_avg_eps else "underperform"}
 
-        # 3. AI Score KPI
         score_query = f"SELECT weighted_score FROM `{config.SCORES_TABLE_ID}` WHERE ticker = @ticker ORDER BY run_date DESC LIMIT 1"
         job_config_score = bigquery.QueryJobConfig(query_parameters=[bigquery.ScalarQueryParameter("ticker", "STRING", ticker)])
         score_df = client.query(score_query, job_config=job_config_score).to_dataframe()
@@ -182,26 +167,25 @@ def _fetch_and_calculate_kpis(ticker: str, latest_quarter: date, industry: str, 
             rec = "BUY" if score > 0.62 else "SELL" if score < 0.44 else "HOLD"
             final_json["kpis"]["aiScore"] = {"value": round((score - 0.5) * 20, 2), "recommendation": rec}
 
-        # 4. Construct Chart URIs
+        # --- THIS IS THE MODIFIED SECTION ---
         chart_date = run_date.strftime('%Y-%m-%d')
         chart_folders = { "90dayPrice": "90-Day-Chart/", "revenueTrend": "Revenue-Chart/", "rsiMacd": "Momentum-Chart/" }
         for key, folder in chart_folders.items():
-            final_json["chartUris"][key] = f"gs://{config.GCS_BUCKET_NAME}/{folder}{ticker}_{chart_date}.webp"
+            final_json["chartUris"][key] = f"gs://{config.DESTINATION_GCS_BUCKET_NAME}/{folder}{ticker}_{chart_date}.webp"
 
-        # 5. Add Business Profile URI
-        final_json["businessProfileUri"] = f"gs://{config.GCS_BUCKET_NAME}/sec-business/{ticker}_{latest_quarter.strftime('%Y-%m-%d')}.json"
-
-        # 6. Upload final JSON to GCS
+        final_json["aiAnalystRecommendationUri"] = f"gs://{config.DESTINATION_GCS_BUCKET_NAME}/{config.RECOMMENDATION_PREFIX}{ticker}_recommendation_{run_date_str}.md"
+        # --- END MODIFIED SECTION ---
+        
+        _delete_old_prep_files(ticker)
         output_blob_name = f"{OUTPUT_PREFIX}{ticker}_{run_date_str}.json"
+        # The prep file itself is still written to the source bucket for the dashboard_generator to find
         gcs.write_text(config.GCS_BUCKET_NAME, output_blob_name, json.dumps(final_json, indent=2), "application/json")
-        logging.info(f"[{ticker}] Successfully generated and uploaded prep JSON.")
+        logging.info(f"[{ticker}] Successfully generated and uploaded prep JSON with destination URIs.")
         return output_blob_name
 
     except Exception as e:
         logging.error(f"[{ticker}] Failed during KPI calculation: {e}", exc_info=True)
         return None
-
-# --- Pipeline Orchestrator ---
 
 def run_pipeline():
     """Orchestrates the data crunching pipeline with multi-threading."""
@@ -221,15 +205,13 @@ def run_pipeline():
             for _, row in work_list_df.iterrows()
         }
         for future in as_completed(future_to_ticker):
-            ticker = future_to_ticker[future]
             try:
                 if future.result():
                     processed_count += 1
             except Exception as exc:
-                logging.error(f"[{ticker}] Worker generated an unhandled exception: {exc}", exc_info=True)
+                logging.error(f"Worker generated an unhandled exception: {exc}", exc_info=True)
 
     logging.info(f"--- Data Cruncher Pipeline Finished. Processed {processed_count} of {len(work_list_df)} tickers. ---")
-
 
 if __name__ == "__main__":
     run_pipeline()

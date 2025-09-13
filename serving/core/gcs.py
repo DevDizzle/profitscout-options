@@ -32,6 +32,17 @@ def write_text(bucket_name: str, blob_name: str, data: str, content_type: str = 
         logging.error(f"Failed to write to blob {blob_name}: {e}")
         raise
 
+def delete_blob(bucket_name: str, blob_name: str):
+    """Deletes a blob from the bucket."""
+    try:
+        bucket = _client().bucket(bucket_name)
+        blob = bucket.blob(blob_name)
+        blob.delete()
+        logging.info(f"Blob {blob_name} deleted.")
+    except Exception as e:
+        logging.error(f"Failed to delete blob {blob_name}: {e}")
+        raise
+
 def get_tickers() -> list[str]:
     """Loads the official ticker list from the GCS bucket."""
     try:
