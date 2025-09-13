@@ -37,7 +37,7 @@ def _calculate_industry_averages(work_list_df: pd.DataFrame) -> Dict[str, Dict[s
         return {}
 
     client = bigquery.Client(project=config.SOURCE_PROJECT_ID)
-    
+
     price_query = f"""
         WITH PriceChanges AS (
             SELECT
@@ -76,7 +76,7 @@ def _calculate_industry_averages(work_list_df: pd.DataFrame) -> Dict[str, Dict[s
             industry = row['industry']
             json_content = future.result()
             if not json_content: continue
-            
+
             try:
                 data = json.loads(json_content)
                 reports = data.get("quarterly_reports", [])
@@ -121,7 +121,7 @@ def _fetch_and_calculate_kpis(ticker: str, latest_quarter: date, industry: str, 
     client = bigquery.Client(project=config.SOURCE_PROJECT_ID)
     run_date = date.today()
     run_date_str = run_date.strftime('%Y-%m-%d')
-    
+
     final_json = {
         "ticker": ticker, "runDate": run_date_str, "kpis": {},
         "chartUris": {}, "aiAnalystRecommendationUri": None
@@ -175,7 +175,7 @@ def _fetch_and_calculate_kpis(ticker: str, latest_quarter: date, industry: str, 
 
         final_json["aiAnalystRecommendationUri"] = f"gs://{config.DESTINATION_GCS_BUCKET_NAME}/{config.RECOMMENDATION_PREFIX}{ticker}_recommendation_{run_date_str}.md"
         # --- END MODIFIED SECTION ---
-        
+
         _delete_old_prep_files(ticker)
         output_blob_name = f"{OUTPUT_PREFIX}{ticker}_{run_date_str}.json"
         # The prep file itself is still written to the source bucket for the dashboard_generator to find
@@ -190,7 +190,7 @@ def _fetch_and_calculate_kpis(ticker: str, latest_quarter: date, industry: str, 
 def run_pipeline():
     """Orchestrates the data crunching pipeline with multi-threading."""
     logging.info("--- Starting Data Cruncher (Prep Stage) Pipeline ---")
-    
+
     work_list_df = _get_work_list()
     if work_list_df.empty:
         logging.warning("No tickers in work list. Exiting.")
