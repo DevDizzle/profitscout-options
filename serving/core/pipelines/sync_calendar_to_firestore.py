@@ -5,6 +5,7 @@ from google.cloud import firestore, bigquery
 from .. import config
 import numpy as np
 import uuid
+import re
 
 # --------- Tunables ----------
 BATCH_SIZE = 500
@@ -29,6 +30,8 @@ def _commit_ops(db, ops):
     for op in ops:
         if op["type"] == "set":
             batch.set(op["ref"], op["data"])
+        elif op["type"] == "delete":
+            batch.delete(op["ref"])
         count += 1
         if count >= BATCH_SIZE:
             batch.commit()
@@ -46,7 +49,7 @@ def _delete_collection_in_batches(collection_ref):
         if not docs:
             break
         ops_to_delete = [{"type": "delete", "ref": d.reference} for d in docs]
-        _commit_ops(db, ops_to_delete)
+        _commit_ops(firestore.Client(project=config.DESTINATION_PROJECT_ID), ops_to_delete)
         deleted_count += len(ops_to_delete)
         logging.info(f"Deleted {deleted_count} docs...")
     logging.info(f"Wipe complete for collection '{collection_ref.id}'.")
@@ -91,12 +94,28 @@ def run_pipeline(full_reset: bool = False):
         logging.warning("No upcoming calendar events found in BigQuery. Collection will be empty.")
         return
 
+    # Use ticker as the primary key, fallback to event_type
+    calendar_df["collection_id"] = np.where(pd.notna(calendar_df["ticker"]), calendar_df["ticker"], calendar_df["event_type"])
+    
+    # Sanitize the collection_id to remove characters that are invalid in Firestore document IDs
+    calendar_df["collection_id"] = calendar_df["collection_id"].str.replace(r'[/]', '_', regex=True)
+
+
     upsert_ops = []
-    for _, row in calendar_df.iterrows():
-        # Since there's no single unique key, we generate one for the document ID
-        doc_id = str(uuid.uuid4())
-        doc_ref = collection_ref.document(doc_id)
-        upsert_ops.append({"type": "set", "ref": doc_ref, "data": row.to_dict()})
+    for collection_id, group in calendar_df.groupby("collection_id"):
+        parent_doc_ref = collection_ref.document(collection_id)
+        
+        # Create a subcollection for the events
+        events_collection_ref = parent_doc_ref.collection("events")
+        
+        for _, row in group.iterrows():
+            # Generate a unique ID for each event document in the subcollection
+            event_doc_id = str(uuid.uuid4())
+            doc_ref = events_collection_ref.document(event_doc_id)
+            
+            # The data for this document is just the event row
+            event_data = row.to_dict()
+            upsert_ops.append({"type": "set", "ref": doc_ref, "data": event_data})
     
     logging.info(f"Upserting {len(upsert_ops)} documents to '{collection_ref.id}'...")
     for chunk in _iter_batches(upsert_ops, BATCH_SIZE):

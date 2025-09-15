@@ -7,7 +7,6 @@ import numpy as np
 
 # --------- Tunables ----------
 BATCH_SIZE = 500
-PRIMARY_KEY_FIELD = "contract_symbol" # Using the unique contract symbol for the document ID
 OPTIONS_TABLE_ID = f"{config.SOURCE_PROJECT_ID}.{config.BIGQUERY_DATASET}.options_candidates"
 FIRESTORE_COLLECTION_NAME = "options_candidates"
 
@@ -104,22 +103,24 @@ def run_pipeline(full_reset: bool = False):
         logging.warning("No options candidates found in BigQuery. Collection will be empty or unchanged.")
         return
 
-    if PRIMARY_KEY_FIELD not in options_df.columns:
-        raise ValueError(f"Expected primary key column '{PRIMARY_KEY_FIELD}' in options_candidates table")
-
     upsert_ops = []
-    for _, row in options_df.iterrows():
-        key = str(row[PRIMARY_KEY_FIELD])
-        doc_ref = collection_ref.document(key)
-        upsert_ops.append({"type": "set", "ref": doc_ref, "data": row.to_dict()})
+    for ticker, group in options_df.groupby("ticker"):
+        doc_ref = collection_ref.document(ticker)
+        contracts = group.to_dict('records')
+        data = {
+            "ticker": ticker,
+            "company_name": group["company_name"].iloc[0],
+            "contracts": contracts
+        }
+        upsert_ops.append({"type": "set", "ref": doc_ref, "data": data})
     
     logging.info(f"Upserting {len(upsert_ops)} documents to '{collection_ref.id}'...")
     for chunk in _iter_batches(upsert_ops, BATCH_SIZE):
         _commit_ops(db, chunk)
     
-    current_keys = set(str(x) for x in options_df[PRIMARY_KEY_FIELD].tolist())
-    existing_keys = [doc.id for doc in collection_ref.stream()]
-    to_delete = [k for k in existing_keys if k not in current_keys]
+    current_tickers = set(options_df["ticker"].unique())
+    existing_tickers = [doc.id for doc in collection_ref.stream()]
+    to_delete = [k for k in existing_tickers if k not in current_tickers]
 
     if to_delete:
         logging.info(f"Deleting {len(to_delete)} stale documents from '{collection_ref.id}'...")

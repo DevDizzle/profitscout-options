@@ -1,4 +1,3 @@
-# serving/core/pipelines/recommendation_generator.py
 import logging
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -10,25 +9,24 @@ import re
 
 # --- Templates and other top-level definitions remain the same ---
 _EXAMPLE_OUTPUT = """
-# American Airlines (AAL) ✈️
+# Oracle (ORCL) ☁️
 
-**BUY** – Momentum-led breakout with supportive news flow.
+**HOLD** – Bearish technicals clash with a strong long-term AI narrative.
 
-**Quick take:** Momentum strength and positive headlines favor upside near term; fundamentals look stable.
+**Quick take:** While current price action is weak, Oracle's massive order backlog and booming AI demand create a compelling, if complex, long-term picture.
 
 ### Profile
-American Airlines is a major network air carrier serving passengers and cargo.
-It operates an extensive domestic and international network with diversified revenue streams.
+Oracle provides comprehensive enterprise IT solutions, including cloud applications (OCA) and infrastructure (OCI), serving a wide range of global clients.
 
 ### Key Highlights
-- ⚡ Momentum breakout on strong volume; trend and breadth improving.
-- 📈 Price strength aligns with supportive headlines and analyst chatter.
-- ⚖️ Management confident, but input costs and fuel risks persist.
-- 📈 Transcript tone improved; guidance modestly higher quarter over quarter.
-- ⚖️ Financials stabilizing; leverage remains a watch item.
-- 📈 Fundamentals show gradual margin recovery and operating efficiency.
+- 🚩 Technical indicators suggest a near-term downtrend.
+- 🚩 Price is trading below its key 21-day and 50-day moving averages.
+- ⚖️ Strong AI demand and a massive $455B in future contracts conflict with current price weakness.
+- 📈 Management reports booming demand for AI infrastructure and cloud services.
+- 📈 Recent quarter revenue grew 12%, driven by strong cloud performance.
+- 🚩 Rising debt (now over $105B) and negative free cash flow are key watch items.
 
-Overall: Momentum-led setup supported by steady fundamentals — appropriate for a BUY.
+Overall: A HOLD is warranted as the powerful fundamental story is not yet reflected in the bearish momentum.
 
 💡 Help shape the future: share your feedback to guide our next update.
 """
@@ -68,18 +66,18 @@ Map aggregated text sections into these labels (for your internal reasoning; do 
   - First bullet: ⚡ momentum summary (from Technicals/News).
   - Second bullet: 📈 or 🚩 momentum confirmation (breakouts/trend/breadth/volume).
   - Remaining bullets: strongest items from Transcript, MD&A, Financials, Fundamentals.
-- Each bullet: start with one emoji (📈 bullish, 🚩 bearish, ⚖️ mixed, ⚡ momentum), then a concise statement (≤ 12 words).
+- Each bullet: start with one emoji (📈 bullish, 🚩 bearish, ⚖️ mixed, ⚡ momentum), then a concise statement (≤ 15 words).
 - Do not include bold subsection labels inside bullets (no "**News Buzz:**", etc.).
 - No additional headings beyond "### Profile" and "### Key Highlights".
 - Total length ≲ 250 words.
 
 ### Content Instructions
-1. **Recommendation**: Strictly "BUY" (> 0.62), "HOLD" (0.44–0.62), or "SELL" (< 0.44). Add a short, confident one-liner with **momentum context**. Do not show the raw score.
-2. **Quick Take**: 1–2 sentences summarizing the overall outlook, leading with momentum.
-3. **Profile**: Summarize the "About" text in **1–2 sentences**.
-4. **Highlights**: Convert mapped analyses into concise emoji bullets (respect the momentum-first ordering).
-5. **Wrap-Up**: End with one sentence ("Overall: ...") explaining why the call fits a momentum-led view now.
-6. **Engagement Hook**: Close with a single call-to-action that encourages feedback.
+1.  **Recommendation**: Strictly "BUY" (> 0.62), "HOLD" (0.44–0.62), or "SELL" (< 0.44). Add a short, confident one-liner that includes the core reason (e.g., "momentum breakout," "fundamental pressure," "technical weakness"). Do not show the raw score.
+2.  **Quick Take**: 1–2 sentences summarizing the overall outlook, leading with momentum. Be specific. Instead of "supportive headlines," say "positive inflation data."
+3.  **Profile**: Summarize the "About" text in **1–2 sentences**.
+4.  **Highlights**: Convert mapped analyses into concise emoji bullets. Each bullet must be a data-driven insight. **Cite specific numbers, trends, or named catalysts** from the input text (e.g., 'Revenue grew 12%,' 'Price broke the 50-day MA,' 'RPO now at $455B'). AVOID vague statements like "Fundamentals are improving."
+5.  **Wrap-Up**: End with one sentence ("Overall: ...") that concisely reconciles the momentum view with the fundamental context.
+6.  **Engagement Hook**: Close with a single call-to-action that encourages feedback.
 
 ### Input Data
 - **Weighted Score**: {weighted_score}
