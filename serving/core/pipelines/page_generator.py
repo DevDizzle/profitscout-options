@@ -91,10 +91,10 @@ def _split_aggregated_text(aggregated_text: str) -> Dict[str, str]:
             text = match.group(2).strip()
             # --- THIS IS THE MODIFIED SECTION ---
             key_map = {
-                "news": "newsSummary", 
-                "technicals": "technicals", 
+                "news": "newsSummary",
+                "technicals": "technicals",
                 "mda": "mdAndA",
-                "transcript": "earningsCall", 
+                "transcript": "earningsCall",
                 "financials": "financials",
                 "fundamentals": "fundamentals" # <-- ADDED
             }
@@ -134,6 +134,16 @@ def _get_data_from_bq(ticker: str, run_date: str) -> Optional[Dict]:
         logging.error(f"[{ticker}] Failed to fetch BQ data for {run_date}: {e}", exc_info=True)
         return None
 
+def _delete_old_page_files(ticker: str):
+    """Deletes all previous page JSON files for a given ticker."""
+    prefix = f"{OUTPUT_PREFIX}{ticker}_page_"
+    blobs_to_delete = gcs.list_blobs(config.GCS_BUCKET_NAME, prefix)
+    for blob_name in blobs_to_delete:
+        try:
+            gcs.delete_blob(config.GCS_BUCKET_NAME, blob_name)
+        except Exception as e:
+            logging.error(f"[{ticker}] Failed to delete old page file {blob_name}: {e}")
+
 
 def process_blob(blob_name: str) -> Optional[str]:
     """
@@ -144,9 +154,9 @@ def process_blob(blob_name: str) -> Optional[str]:
     match = dated_format_regex.match(file_name)
     if not match:
         return None
-    
+
     ticker, run_date_str = match.groups()
-    
+
     bq_data = _get_data_from_bq(ticker, run_date_str)
     if not bq_data or not bq_data.get("company_name"):
         logging.error(f"[{ticker}] Could not find BQ data or company name for {run_date_str}.")
@@ -157,7 +167,7 @@ def process_blob(blob_name: str) -> Optional[str]:
     company_name = bq_data.get("company_name")
 
     full_analysis_sections = _split_aggregated_text(aggregated_text)
-    
+
     bullish_score = round((weighted_score - 0.5) * 20, 2) if weighted_score is not None else 0.0
 
     final_json = {
@@ -178,20 +188,21 @@ def process_blob(blob_name: str) -> Optional[str]:
 
     json_blob_path = f"{OUTPUT_PREFIX}{ticker}_page_{run_date_str}.json"
     logging.info(f"[{ticker}] Generating SEO/Teaser JSON for {run_date_str}.")
-    
+
     try:
         llm_response_str = vertex_ai.generate(prompt)
-        
+
         if llm_response_str.strip().startswith("```json"):
             llm_response_str = re.search(r'\{.*\}', llm_response_str, re.DOTALL).group(0)
 
         llm_generated_data = json.loads(llm_response_str)
         final_json.update(llm_generated_data)
 
+        _delete_old_page_files(ticker)
         gcs.write_text(config.GCS_BUCKET_NAME, json_blob_path, json.dumps(final_json, indent=2), "application/json")
         logging.info(f"[{ticker}] Successfully uploaded complete JSON file to {json_blob_path}")
         return json_blob_path
-        
+
     except (json.JSONDecodeError, ValueError, AttributeError) as e:
         logging.error(f"[{ticker}] Failed to generate/parse LLM JSON. Error: {e}. Response: '{llm_response_str}'")
         return None
@@ -203,10 +214,10 @@ def process_blob(blob_name: str) -> Optional[str]:
 def run_pipeline():
     """Finds recommendation files that are missing a page and processes them."""
     logging.info("--- Starting Page Generation Pipeline ---")
-    
+
     all_recommendations = gcs.list_blobs(config.GCS_BUCKET_NAME, prefix=INPUT_PREFIX)
     all_pages = set(gcs.list_blobs(config.GCS_BUCKET_NAME, prefix=OUTPUT_PREFIX))
-    
+
     work_items = []
     dated_format_regex = re.compile(r'([A-Z\.]+)_recommendation_(\d{4}-\d{2}-\d{2})\.md$')
 
@@ -214,7 +225,7 @@ def run_pipeline():
         file_name = os.path.basename(rec_path)
         match = dated_format_regex.match(file_name)
         if not match: continue
-            
+
         ticker, run_date_str = match.groups()
         expected_page_path = f"{OUTPUT_PREFIX}{ticker}_page_{run_date_str}.json"
 
@@ -229,5 +240,5 @@ def run_pipeline():
     with ThreadPoolExecutor(max_workers=config.MAX_WORKERS_RECOMMENDER) as executor:
         futures = [executor.submit(process_blob, item) for item in work_items]
         count = sum(1 for future in as_completed(futures) if future.result())
-    
+
     logging.info(f"--- Page Generation Pipeline Finished. Processed {count} new pages. ---")

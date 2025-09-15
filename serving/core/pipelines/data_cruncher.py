@@ -31,77 +31,40 @@ def _get_work_list() -> pd.DataFrame:
     return df
 
 def _calculate_industry_averages(work_list_df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
-    """Calculates industry-level average KPIs."""
+    """Calculates industry-level average KPIs based on enriched price_data."""
     logging.info("Calculating industry-level average KPIs...")
     if work_list_df.empty:
         return {}
 
     client = bigquery.Client(project=config.SOURCE_PROJECT_ID)
 
-    price_query = f"""
-        WITH PriceChanges AS (
+    industry_query = f"""
+        WITH latest_prices AS (
+            SELECT ticker, MAX(date) AS max_date
+            FROM `{config.PROJECT_ID}.{config.BIGQUERY_DATASET}.price_data`
+            GROUP BY ticker
+        ),
+        enriched AS (
             SELECT
-                ticker,
-                (adj_close - prev_close_30d) / NULLIF(prev_close_30d, 0) * 100 AS change_pct_30d
-            FROM (
-                SELECT
-                    ticker,
-                    date,
-                    adj_close,
-                    LAG(adj_close, 30) OVER (PARTITION BY ticker ORDER BY date) AS prev_close_30d,
-                    ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY date DESC) AS rn
-                FROM `{config.PRICE_DATA_TABLE_ID}`
-            )
-            WHERE rn = 1
+                p.ticker,
+                p.close_30d_delta_pct,
+                p.iv_avg,
+                m.industry
+            FROM latest_prices lp
+            JOIN `{config.PROJECT_ID}.{config.BIGQUERY_DATASET}.price_data` p
+                ON lp.ticker = p.ticker AND lp.max_date = p.date
+            JOIN `{config.BUNDLER_STOCK_METADATA_TABLE_ID}` m ON p.ticker = m.ticker
+            WHERE p.close_30d_delta_pct IS NOT NULL AND m.industry IS NOT NULL
         )
         SELECT
-            m.industry,
-            AVG(pc.change_pct_30d) as avg_change_pct_30d
-        FROM PriceChanges pc
-        JOIN `{config.BUNDLER_STOCK_METADATA_TABLE_ID}` m ON pc.ticker = m.ticker
-        WHERE m.industry IS NOT NULL
-        GROUP BY m.industry
+            industry,
+            AVG(close_30d_delta_pct) AS avg_30d_change_pct,
+            AVG(iv_avg) AS avg_iv
+        FROM enriched
+        GROUP BY industry
     """
-    price_change_df = client.query(price_query).to_dataframe()
-    industry_price_change_avg = price_change_df.set_index('industry')['avg_change_pct_30d'].to_dict()
-
-    all_eps_growth = []
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_row = {
-            executor.submit(gcs.read_blob, config.GCS_BUCKET_NAME, f"financial-statements/{row['ticker']}_{row['latest_quarter'].strftime('%Y-%m-%d')}.json"): row
-            for _, row in work_list_df.iterrows()
-        }
-        for future in as_completed(future_to_row):
-            row = future_to_row[future]
-            industry = row['industry']
-            json_content = future.result()
-            if not json_content: continue
-
-            try:
-                data = json.loads(json_content)
-                reports = data.get("quarterly_reports", [])
-                if len(reports) >= 2:
-                    latest_eps = reports[0].get("income_statement", {}).get("eps")
-                    prev_eps = reports[1].get("income_statement", {}).get("eps")
-                    if latest_eps is not None and prev_eps is not None and prev_eps != 0:
-                        eps_qoq = (latest_eps - prev_eps) / abs(prev_eps) * 100
-                        all_eps_growth.append({"industry": industry, "eps_qoq": eps_qoq})
-            except (json.JSONDecodeError, KeyError):
-                continue
-
-    if all_eps_growth:
-        eps_growth_df = pd.DataFrame(all_eps_growth)
-        industry_eps_growth_avg = eps_growth_df.groupby('industry')['eps_qoq'].mean().to_dict()
-    else:
-        industry_eps_growth_avg = {}
-
-    industry_averages = {}
-    all_industries = set(industry_price_change_avg.keys()) | set(industry_eps_growth_avg.keys())
-    for industry in all_industries:
-        industry_averages[industry] = {
-            "avg_change_pct_30d": industry_price_change_avg.get(industry),
-            "avg_eps_qoq": industry_eps_growth_avg.get(industry)
-        }
+    industry_df = client.query(industry_query).to_dataframe()
+    industry_averages = industry_df.set_index('industry').to_dict(orient='index')
     return industry_averages
 
 def _delete_old_prep_files(ticker: str):
@@ -116,71 +79,87 @@ def _delete_old_prep_files(ticker: str):
 
 def _fetch_and_calculate_kpis(ticker: str, latest_quarter: date, industry: str, industry_averages: Dict) -> Optional[str]:
     """
-    Fetches all data for a single ticker, calculates KPIs, and returns the generated JSON file path.
+    Fetches enriched data from price_data for a single ticker, calculates KPIs, and returns the generated JSON file path.
     """
     client = bigquery.Client(project=config.SOURCE_PROJECT_ID)
     run_date = date.today()
     run_date_str = run_date.strftime('%Y-%m-%d')
 
     final_json = {
-        "ticker": ticker, "runDate": run_date_str, "kpis": {},
-        "chartUris": {}, "aiAnalystRecommendationUri": None
+        "ticker": ticker, "runDate": run_date_str, "kpis": {}
     }
 
     try:
-        price_query = f"SELECT date, adj_close FROM `{config.PRICE_DATA_TABLE_ID}` WHERE ticker = @ticker AND date <= @run_date ORDER BY date DESC LIMIT 31"
-        job_config = bigquery.QueryJobConfig(query_parameters=[bigquery.ScalarQueryParameter("ticker", "STRING", ticker), bigquery.ScalarQueryParameter("run_date", "DATE", run_date)])
-        price_df = client.query(price_query, job_config=job_config).to_dataframe()
-        if len(price_df) >= 1:
-            latest_close = price_df['adj_close'].iloc[0]
-            prev_close = price_df['adj_close'].iloc[1] if len(price_df) > 1 else None
-            daily_change = (latest_close - prev_close) / prev_close * 100 if prev_close and prev_close != 0 else 0.0
-            close_30d_ago = price_df['adj_close'].iloc[-1] if len(price_df) >= 30 else None
-            change_30d = (latest_close - close_30d_ago) / close_30d_ago * 100 if close_30d_ago and close_30d_ago != 0 else 0.0
-            industry_avg_30d = industry_averages.get(industry, {}).get("avg_change_pct_30d")
-            final_json["kpis"]["price"] = {"value": round(latest_close, 2), "dailyChangePct": round(daily_change, 2), "signal": "positive" if daily_change > 0 else "negative"}
-            final_json["kpis"]["thirtyDayChange"] = {"value": round(change_30d, 2), "vsIndustry": round(industry_avg_30d, 2) if pd.notna(industry_avg_30d) else "unavailable", "signal": "outperform" if pd.notna(industry_avg_30d) and change_30d > industry_avg_30d else "underperform"}
+        # Fetch enriched data from price_data (latest row)
+        enriched_query = f"""
+            WITH latest AS (
+                SELECT MAX(date) AS max_date
+                FROM `{config.PROJECT_ID}.{config.BIGQUERY_DATASET}.price_data`
+                WHERE ticker = @ticker
+            )
+            SELECT
+                p.date,
+                p.adj_close,
+                p.iv_avg,
+                p.iv_percentile,
+                p.hv_30,
+                p.latest_rsi,
+                p.rsi_30d_delta,
+                p.latest_macd,
+                p.macd_30d_delta,
+                p.close_30d_delta_pct
+            FROM latest l
+            JOIN `{config.PROJECT_ID}.{config.BIGQUERY_DATASET}.price_data` p
+                ON p.date = l.max_date AND p.ticker = @ticker
+        """
+        job_config = bigquery.QueryJobConfig(query_parameters=[bigquery.ScalarQueryParameter("ticker", "STRING", ticker)])
+        enriched_df = client.query(enriched_query, job_config=job_config).to_dataframe()
 
-        financials_blob_name = f"financial-statements/{ticker}_{latest_quarter.strftime('%Y-%m-%d')}.json"
-        json_content = gcs.read_blob(config.GCS_BUCKET_NAME, financials_blob_name)
-        if json_content:
-            data = json.loads(json_content)
-            reports = data.get("quarterly_reports", [])
-            if len(reports) >= 2:
-                latest_rev = reports[0].get("income_statement", {}).get("revenue")
-                prev_rev = reports[1].get("income_statement", {}).get("revenue")
-                latest_eps = reports[0].get("income_statement", {}).get("eps")
-                prev_eps = reports[1].get("income_statement", {}).get("eps")
-                if latest_rev is not None and prev_rev is not None and prev_rev != 0:
-                    rev_qoq = (latest_rev - prev_rev) / abs(prev_rev) * 100
-                    final_json["kpis"]["revenueQoQ"] = {"value": round(rev_qoq, 2), "signal": "strong" if rev_qoq > 5 else "weak" if rev_qoq < 0 else "moderate"}
-                if latest_eps is not None and prev_eps is not None and prev_eps != 0:
-                    eps_qoq = (latest_eps - prev_eps) / abs(prev_eps) * 100
-                    industry_avg_eps = industry_averages.get(industry, {}).get("avg_eps_qoq")
-                    final_json["kpis"]["epsGrowth"] = {"value": round(eps_qoq, 2), "vsIndustry": round(industry_avg_eps, 2) if pd.notna(industry_avg_eps) else "unavailable", "signal": "outperform" if pd.notna(industry_avg_eps) and eps_qoq > industry_avg_eps else "underperform"}
+        if enriched_df.empty:
+            logging.warning(f"[{ticker}] No enriched price data found.")
+            return None
 
-        score_query = f"SELECT weighted_score FROM `{config.SCORES_TABLE_ID}` WHERE ticker = @ticker ORDER BY run_date DESC LIMIT 1"
-        job_config_score = bigquery.QueryJobConfig(query_parameters=[bigquery.ScalarQueryParameter("ticker", "STRING", ticker)])
-        score_df = client.query(score_query, job_config=job_config_score).to_dataframe()
-        if not score_df.empty:
-            score = score_df['weighted_score'].iloc[0]
-            rec = "BUY" if score > 0.62 else "SELL" if score < 0.44 else "HOLD"
-            final_json["kpis"]["aiScore"] = {"value": round((score - 0.5) * 20, 2), "recommendation": rec}
+        latest_row = enriched_df.iloc[0]
+        industry_avg = industry_averages.get(industry, {})
 
-        # --- THIS IS THE MODIFIED SECTION ---
-        chart_date = run_date.strftime('%Y-%m-%d')
-        chart_folders = { "90dayPrice": "90-Day-Chart/", "revenueTrend": "Revenue-Chart/", "rsiMacd": "Momentum-Chart/" }
-        for key, folder in chart_folders.items():
-            final_json["chartUris"][key] = f"gs://{config.DESTINATION_GCS_BUCKET_NAME}/{folder}{ticker}_{chart_date}.webp"
+        # KPI 1: Current Price
+        # Assuming daily change from previous day (query prev_close if needed; for simplicity, assume we add it or compute)
+        prev_close_query = f"""
+            SELECT adj_close AS prev_close
+            FROM `{config.PROJECT_ID}.{config.BIGQUERY_DATASET}.price_data`
+            WHERE ticker = @ticker AND date = DATE_SUB(@run_date, INTERVAL 1 DAY)
+        """
+        prev_df = client.query(prev_close_query, job_config=bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("ticker", "STRING", ticker), bigquery.ScalarQueryParameter("run_date", "DATE", run_date)]
+        )).to_dataframe()
+        prev_close = prev_df['prev_close'].iloc[0] if not prev_df.empty else latest_row['adj_close']
+        daily_change_pct = ((latest_row['adj_close'] - prev_close) / prev_close * 100) if prev_close != 0 else 0.0
+        price_signal = "positive" if daily_change_pct > 0 else "negative"
+        final_json["kpis"]["price"] = {"value": round(latest_row['adj_close'], 2), "dailyChangePct": round(daily_change_pct, 2), "signal": price_signal}
 
-        final_json["aiAnalystRecommendationUri"] = f"gs://{config.DESTINATION_GCS_BUCKET_NAME}/{config.RECOMMENDATION_PREFIX}{ticker}_recommendation_{run_date_str}.md"
-        # --- END MODIFIED SECTION ---
+        # KPI 2: Implied Volatility (IV)
+        iv_vs = latest_row['iv_percentile'] if pd.notna(latest_row['iv_percentile']) else latest_row['hv_30']
+        iv_signal = "high" if (latest_row['iv_avg'] > (iv_vs or 0) + 10) else "low"  # Simple derivation; adjust as needed
+        final_json["kpis"]["impliedVolatility"] = {"value": round(latest_row['iv_avg'], 2), "vsContext": round(iv_vs or 0, 2), "signal": iv_signal}
+
+        # KPI 3: RSI
+        rsi_signal = "oversold" if latest_row['latest_rsi'] < 30 else "overbought" if latest_row['latest_rsi'] > 70 else "neutral"
+        final_json["kpis"]["rsi"] = {"value": round(latest_row['latest_rsi'], 2), "thirtyDayDelta": round(latest_row['rsi_30d_delta'], 2), "signal": rsi_signal}
+
+        # KPI 4: MACD
+        macd_signal = "bullish" if latest_row['latest_macd'] > 0 and latest_row['macd_30d_delta'] > 0 else "bearish" if latest_row['latest_macd'] < 0 else "neutral"
+        final_json["kpis"]["macd"] = {"value": round(latest_row['latest_macd'], 2), "thirtyDayDelta": round(latest_row['macd_30d_delta'], 2), "signal": macd_signal}
+
+        # KPI 5: 30-Day Price Change
+        industry_avg_30d = industry_avg.get("avg_30d_change_pct")
+        change_signal = "outperform" if pd.notna(industry_avg_30d) and latest_row['close_30d_delta_pct'] > industry_avg_30d else "underperform"
+        final_json["kpis"]["thirtyDayPriceChange"] = {"value": round(latest_row['close_30d_delta_pct'], 2), "vsIndustry": round(industry_avg_30d, 2) if pd.notna(industry_avg_30d) else "unavailable", "signal": change_signal}
 
         _delete_old_prep_files(ticker)
         output_blob_name = f"{OUTPUT_PREFIX}{ticker}_{run_date_str}.json"
         # The prep file itself is still written to the source bucket for the dashboard_generator to find
         gcs.write_text(config.GCS_BUCKET_NAME, output_blob_name, json.dumps(final_json, indent=2), "application/json")
-        logging.info(f"[{ticker}] Successfully generated and uploaded prep JSON with destination URIs.")
+        logging.info(f"[{ticker}] Successfully generated and uploaded prep JSON with KPIs.")
         return output_blob_name
 
     except Exception as e:

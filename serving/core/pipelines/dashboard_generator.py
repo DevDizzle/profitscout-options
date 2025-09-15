@@ -3,7 +3,6 @@ import logging
 import pandas as pd
 import json
 import re
-import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from google.cloud import bigquery
 from datetime import date
@@ -18,7 +17,7 @@ PREP_PREFIX = "prep/"
 OUTPUT_PREFIX = "dashboards/"
 MAX_WORKERS = 8
 
-# --- LLM Prompting ---
+# --- LLM Prompting for SEO/Teaser (Simplified, No Alt Text) ---
 
 _EXAMPLE_JSON_FOR_LLM = """
 {
@@ -35,17 +34,12 @@ _EXAMPLE_JSON_FOR_LLM = """
       "30-Day Change vs Industry": "Outperform",
       "Revenue QoQ": "Strong"
     }
-  },
-  "altText": {
-    "90dayPrice": "90-day price chart for AAPL showing a clear uptrend, with the price consistently above its 50-day moving average, indicating bullish momentum.",
-    "revenueTrend": "Quarterly revenue trend chart for AAPL, displaying steady year-over-year growth for the past four quarters.",
-    "rsiMacd": "RSI and MACD chart for AAPL. The RSI is in neutral territory while the MACD line has recently crossed above its signal line, a positive indicator."
   }
 }
 """
 
 _PROMPT_TEMPLATE = r"""
-You are an expert financial copywriter and SEO analyst for a fintech company named "ProfitScout". Your task is to generate a specific JSON object containing SEO metadata, a teaser summary, and chart alt text for a stock dashboard page, based ONLY on the data provided.
+You are an expert financial copywriter and SEO analyst for a fintech company named "ProfitScout". Your task is to generate a specific JSON object containing SEO metadata and a teaser summary for a stock dashboard page, based ONLY on the data provided.
 
 ### Signal Policy
 Use the `recommendation` from the AI Score KPI to set the teaser signal:
@@ -66,12 +60,9 @@ Use the `recommendation` from the AI Score KPI to set the teaser signal:
 4.  **Teaser Section**:
     * `signal`: Use the signal from the policy above.
     * `summary`: A sharp 1–2 sentence outlook combining the AI signal with insights from the KPIs provided.
-    * `metrics`: A dictionary of **exactly 3** key-value pairs derived from the `kpis` data. Prioritize the AI Score, 30-Day Change vs Industry, and Revenue QoQ.
+    * `metrics`: A dictionary of **exactly 3** key-value pairs derived from the `kpis` data. Prioritize the AI Score, 30-Day Change vs Industry, and one other relevant KPI.
 
-5.  **Chart Alt Text**:
-    * For each chart key (`90dayPrice`, `revenueTrend`, `rsiMacd`), write a descriptive 20-40 word alt text. The text should describe what the chart shows and mention the ticker.
-
-6.  **Format**:
+5.  **Format**:
     * Output **ONLY** the JSON object that matches the example structure exactly.
 
 ### Input Data
@@ -97,16 +88,8 @@ def _delete_old_dashboard_files(ticker: str):
         except Exception as e:
             logging.error(f"[{ticker}] Failed to delete old dashboard file {blob_name}: {e}")
 
-def _get_recommendation_and_metadata(ticker: str) -> Dict[str, Any]:
-    """Fetches the latest recommendation markdown and company metadata."""
-    data = {"recommendation_text": None, "company_name": None, "sector": None, "industry": None}
-    
-    latest_rec_blob = gcs.get_latest_blob_for_ticker(config.GCS_BUCKET_NAME, config.RECOMMENDATION_PREFIX, ticker)
-    if latest_rec_blob:
-        data["recommendation_text"] = latest_rec_blob.download_as_text()
-    else:
-        logging.warning(f"[{ticker}] No recommendation markdown file found.")
-
+def _get_company_metadata(ticker: str) -> Dict[str, Any]:
+    """Fetches company metadata from BQ."""
     client = bigquery.Client(project=config.SOURCE_PROJECT_ID)
     query = f"""
         SELECT company_name, sector, industry
@@ -118,11 +101,12 @@ def _get_recommendation_and_metadata(ticker: str) -> Dict[str, Any]:
     job_config = bigquery.QueryJobConfig(query_parameters=[bigquery.ScalarQueryParameter("ticker", "STRING", ticker)])
     df = client.query(query, job_config=job_config).to_dataframe()
     if not df.empty:
-        data["company_name"] = df["company_name"].iloc[0]
-        data["sector"] = df["sector"].iloc[0]
-        data["industry"] = df["industry"].iloc[0]
-
-    return data
+        return {
+            "company_name": df["company_name"].iloc[0],
+            "sector": df["sector"].iloc[0],
+            "industry": df["industry"].iloc[0]
+        }
+    return {"company_name": ticker, "sector": None, "industry": None}
 
 def _infer_related_stocks(ticker: str, industry: str) -> List[str]:
     """Queries BQ for up to 3 other tickers in the same industry."""
@@ -145,6 +129,55 @@ def _infer_related_stocks(ticker: str, industry: str) -> List[str]:
     df = client.query(query, job_config=job_config).to_dataframe()
     return df["ticker"].tolist()
 
+def _get_options_recommendation(ticker: str) -> Optional[Dict[str, Any]]:
+    """Fetches the latest options analysis JSON from GCS."""
+    latest_blob = gcs.get_latest_blob_for_ticker(config.GCS_BUCKET_NAME, OUTPUT_PREFIX, ticker, suffix="_best_option_analysis.json")
+    if latest_blob:
+        content = latest_blob.download_as_text()
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            logging.warning(f"[{ticker}] Invalid JSON in options analysis.")
+    return None
+
+def _get_options_chain_table(ticker: str) -> List[Dict[str, Any]]:
+    """Queries latest options_candidates for the ticker, formats as array for table."""
+    client = bigquery.Client(project=config.SOURCE_PROJECT_ID)
+    query = f"""
+        SELECT
+            contract_symbol,
+            option_type,
+            expiration_date,
+            strike,
+            last_price,
+            bid,
+            ask,
+            volume,
+            open_interest,
+            implied_volatility,
+            delta,
+            theta,
+            options_score,
+            rn
+        FROM `{config.PROJECT_ID}.{config.BIGQUERY_DATASET}.options_candidates`
+        WHERE ticker = @ticker
+          AND selection_run_ts >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
+        ORDER BY options_score DESC, rn
+        LIMIT 10
+    """
+    job_config = bigquery.QueryJobConfig(query_parameters=[bigquery.ScalarQueryParameter("ticker", "STRING", ticker)])
+    df = client.query(query, job_config=job_config).to_dataframe()
+    if df.empty:
+        return []
+    
+    # Convert to list of dicts for JSON
+    return df.to_dict('records')
+
+def _get_economic_calendar(ticker: str) -> Dict[str, Any]:
+    """Placeholder for calendar; fetch from BQ or GCS if available. For now, empty."""
+    # Example: Query a calendar table filtered by sector/industry impact
+    return {}  # Or implement fetch
+
 # --- Main Worker and Pipeline ---
 
 def process_ticker(prep_blob_name: str) -> Optional[str]:
@@ -166,11 +199,12 @@ def process_ticker(prep_blob_name: str) -> Optional[str]:
             return None
         prep_data = json.loads(prep_json_str)
 
-        metadata = _get_recommendation_and_metadata(ticker)
+        metadata = _get_company_metadata(ticker)
         company_name = metadata.get("company_name", ticker)
         
         related_stocks = _infer_related_stocks(ticker, metadata.get("industry"))
         
+        # Generate SEO/Teaser via LLM (using prep KPIs)
         prompt = _PROMPT_TEMPLATE.format(
             ticker=ticker,
             company_name=company_name,
@@ -184,19 +218,31 @@ def process_ticker(prep_blob_name: str) -> Optional[str]:
             llm_response_str = re.search(r'\{.*\}', llm_response_str, re.DOTALL).group(0)
         llm_data = json.loads(llm_response_str)
 
+        # Fetch options recommendation
+        options_rec = _get_options_recommendation(ticker)
+        
+        # Fetch options chain table
+        chain_table = _get_options_chain_table(ticker)
+        
+        # Fetch calendar
+        calendar = _get_economic_calendar(ticker)
+
         final_dashboard = {
             "ticker": ticker, "runDate": run_date_str,
             "titleInfo": { "companyName": company_name, "ticker": ticker, "asOfDate": run_date_str },
             "kpis": prep_data.get("kpis"),
-            "aiAnalystRecommendation": { "title": "AI Analyst Recommendation", "markdownContent": metadata.get("recommendation_text") },
-            "charts": {
-                key: {"uri": uri, "alt": llm_data.get("altText", {}).get(key, f"Chart for {key} for {ticker}")}
-                for key, uri in prep_data.get("chartUris", {}).items()
+            "optionsRecommendation": {
+                "title": "AI Options Recommendation",
+                "selectedContract": options_rec.get("selected_contract") if options_rec else None,
+                "analysis": options_rec.get("analysis") if options_rec else "No options analysis available.",
+                "reasoning": options_rec.get("reasoning") if options_rec else None,
+                "chainTable": chain_table
             },
             "seo": llm_data.get("seo"),
             "teaser": llm_data.get("teaser"),
             "relatedStocks": related_stocks,
-            "calendar": {}, "options": {},
+            "calendar": calendar,
+            "options": {}  # Legacy or additional options data if needed
         }
         
         _delete_old_dashboard_files(ticker)

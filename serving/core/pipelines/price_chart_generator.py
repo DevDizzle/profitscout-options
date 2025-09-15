@@ -1,61 +1,37 @@
 # serving/core/pipelines/price_chart_generator.py
 import logging
 import pandas as pd
-import numpy as np
-import io
-import os
 import json
 from datetime import date
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from queue import Queue
-import threading
 
 from google.cloud import bigquery
-
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
 
 from .. import config, gcs
 
 # --- Configuration ---
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-PRICE_CHART_FOLDER = "90-Day-Chart/"
-TICKER_LIST_PATH = "tickerlist.txt"
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s")
+# The output folder in GCS for the new JSON files
+PRICE_CHART_JSON_FOLDER = "price-chart-json/"
+MAX_WORKERS = 8
 
-_PLOT_LOCK = threading.Lock()
-PLOT_QUEUE: "Queue[tuple[callable, tuple, dict]]" = Queue()
-
-
-def _plotter():
-    """Dedicated plotter thread: serializes all Matplotlib access."""
-    while True:
-        task = PLOT_QUEUE.get()
-        if task is None:
-            PLOT_QUEUE.task_done()
-            break
-        func, args, kwargs = task
-        try:
-            func(*args, **kwargs)
-        except Exception as e:
-            logging.exception(f"Plot task failed: {e}")
-        finally:
-            PLOT_QUEUE.task_done()
-
-
-def _enqueue_plot(func, *args, **kwargs):
-    """Enqueue a plotting task."""
-    PLOT_QUEUE.put((func, args, kwargs))
+# --- Data Fetching and Processing ---
 
 def _get_all_price_histories(tickers: list[str]) -> dict[str, pd.DataFrame]:
-    """Fetch price history for all tickers in a single BigQuery call."""
+    """
+    Fetches price history for all tickers in a single BigQuery call.
+    Now includes OHLC and volume data needed for candlestick charts.
+    """
     if not tickers:
         return {}
+    
     client = bigquery.Client(project=config.SOURCE_PROJECT_ID)
-    fixed_start_date = "2020-01-01"
+    # We need at least 200 days of data to calculate the 200-day SMA, plus 90 days for the chart.
+    # Fetching a bit more to be safe.
+    start_date = date.today() - pd.Timedelta(days=365)
+    
     query = f"""
-        SELECT ticker, date, adj_close
+        SELECT ticker, date, open, high, low, adj_close, volume
         FROM `{config.PRICE_DATA_TABLE_ID}`
         WHERE ticker IN UNNEST(@tickers) AND date >= @start_date
         ORDER BY ticker, date ASC
@@ -63,107 +39,105 @@ def _get_all_price_histories(tickers: list[str]) -> dict[str, pd.DataFrame]:
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
             bigquery.ArrayQueryParameter("tickers", "STRING", tickers),
-            bigquery.ScalarQueryParameter("start_date", "DATE", fixed_start_date),
+            bigquery.ScalarQueryParameter("start_date", "DATE", start_date.isoformat()),
         ]
     )
     full_df = client.query(query, job_config=job_config).to_dataframe()
     return {t: grp.copy() for t, grp in full_df.groupby("ticker")}
 
-def _delete_old_price_charts(ticker: str):
-    """Deletes all previous price chart images for a given ticker."""
-    prefix = f"{PRICE_CHART_FOLDER}{ticker}_"
+def _delete_old_price_json(ticker: str):
+    """Deletes all previous price chart JSON files for a given ticker."""
+    prefix = f"{PRICE_CHART_JSON_FOLDER}{ticker}_"
     blobs_to_delete = gcs.list_blobs(config.GCS_BUCKET_NAME, prefix)
     for blob_name in blobs_to_delete:
         try:
             gcs.delete_blob(config.GCS_BUCKET_NAME, blob_name)
         except Exception as e:
-            logging.error(f"[{ticker}] Failed to delete old price chart {blob_name}: {e}")
+            logging.error(f"[{ticker}] Failed to delete old price chart JSON {blob_name}: {e}")
 
-def _generate_price_chart(ticker: str, price_df: pd.DataFrame) -> str | None:
-    """Generates a 90-day price chart and uploads it to GCS."""
+def _generate_price_chart_json(ticker: str, price_df: pd.DataFrame) -> str | None:
+    """
+    Generates a 90-day price chart JSON object and uploads it to GCS.
+    """
     if price_df is None or price_df.empty:
+        logging.warning(f"[{ticker}] No price data provided for JSON generation.")
         return None
 
     df = price_df.copy()
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df = df.dropna(subset=["date", "adj_close"]).sort_values("date")
+    df = df.dropna(subset=["date", "adj_close", "open", "high", "low", "volume"]).sort_values("date")
+
+    # Calculate moving averages
     if len(df) >= 50:
-        df["sma_50"] = df["adj_close"].rolling(window=50).mean()
+        df["sma_50"] = df["adj_close"].rolling(window=50).mean().round(2)
     if len(df) >= 200:
-        df["sma_200"] = df["adj_close"].rolling(window=200).mean()
+        df["sma_200"] = df["adj_close"].rolling(window=200).mean().round(2)
+    
+    # Take the last 90 days for the final output
     plot_df = df.tail(90)
     if plot_df.empty:
         return None
 
+    # Format data for JSON output
+    chart_data = {
+        "candlestick": [
+            {"date": row.date.strftime('%Y-%m-%d'), "open": row.open, "high": row.high, "low": row.low, "close": row.adj_close}
+            for row in plot_df.itertuples()
+        ],
+        "volume": [
+            {"date": row.date.strftime('%Y-%m-%d'), "value": row.volume}
+            for row in plot_df.itertuples()
+        ],
+        "sma50": [
+            {"date": row.date.strftime('%Y-%m-%d'), "value": row.sma_50}
+            for row in plot_df.itertuples() if "sma_50" in row and pd.notna(row.sma_50)
+        ],
+        "sma200": [
+            {"date": row.date.strftime('%Y-%m-%d'), "value": row.sma_200}
+            for row in plot_df.itertuples() if "sma_200" in row and pd.notna(row.sma_200)
+        ],
+    }
+    
     today_str = date.today().strftime('%Y-%m-%d')
-    local_file_path = f"{ticker}_price_chart_{today_str}.webp"
-
-    with _PLOT_LOCK:
-        fig, ax = plt.subplots(figsize=(10, 5), dpi=160)
-        try:
-            bg, price_c, sma50_c, sma200_c = "#20222D", "#9CFF0A", "#00BFFF", "#FF6347"
-            fig.patch.set_facecolor(bg)
-            ax.set_facecolor(bg)
-            ax.plot(plot_df["date"], plot_df["adj_close"], label="Price", color=price_c, linewidth=2.2)
-            if "sma_50" in plot_df.columns:
-                ax.plot(plot_df["date"], plot_df["sma_50"], label="50-Day SMA", color=sma50_c, linestyle="--", linewidth=1.6)
-            if "sma_200" in plot_df.columns:
-                ax.plot(plot_df["date"], plot_df["sma_200"], label="200-Day SMA", color=sma200_c, linestyle="--", linewidth=1.6)
-            ax.set_title(f"{ticker} — 90-Day Price", color="white", fontsize=14, pad=12)
-            ax.tick_params(axis="both", colors="#C8C9CC", labelsize=9)
-            ax.grid(True, linestyle="--", alpha=0.15)
-            leg = ax.legend(loc="upper left", frameon=False)
-            for text in leg.get_texts():
-                text.set_color("#EDEEEF")
-            plt.tight_layout()
-            fig.savefig(local_file_path, format="webp", bbox_inches="tight")
-        finally:
-            plt.close(fig)
-
+    blob_name = f"{PRICE_CHART_JSON_FOLDER}{ticker}_{today_str}.json"
+    
     try:
-        _delete_old_price_charts(ticker)
-        blob_name = f"{PRICE_CHART_FOLDER}{ticker}_{today_str}.webp"
-        gcs_uri = gcs.upload_from_filename(config.GCS_BUCKET_NAME, local_file_path, blob_name, content_type="image/webp")
-        if gcs_uri:
-            logging.info(f"[{ticker}] Successfully uploaded price chart to {gcs_uri}")
-        return gcs_uri
-    finally:
-        if os.path.exists(local_file_path):
-            os.remove(local_file_path)
+        _delete_old_price_json(ticker)
+        gcs.write_text(config.GCS_BUCKET_NAME, blob_name, json.dumps(chart_data), "application/json")
+        logging.info(f"[{ticker}] Successfully uploaded price chart JSON to gs://{config.GCS_BUCKET_NAME}/{blob_name}")
+        return blob_name
+    except Exception as e:
+        logging.error(f"[{ticker}] Failed to upload price chart JSON: {e}", exc_info=True)
+        return None
 
 def process_ticker(ticker: str, price_histories: dict):
-    """Worker: prepare data & enqueue plotting tasks."""
+    """Worker: prepares data and triggers the JSON generation for a single ticker."""
     price_df = price_histories.get(ticker)
     if price_df is None or price_df.empty:
-        logging.warning(f"[{ticker}] No price data available for chart.")
-    else:
-        _enqueue_plot(_generate_price_chart, ticker, price_df.copy())
-    return ticker
+        logging.warning(f"[{ticker}] No price data available for chart JSON.")
+        return None
+    
+    return _generate_price_chart_json(ticker, price_df.copy())
 
 def run_pipeline():
-    """Orchestrate price chart generation."""
-    logging.info("--- Starting Price Chart Generation Script ---")
+    """Orchestrates the price chart JSON generation."""
+    logging.info("--- Starting Price Chart JSON Generation Pipeline ---")
     tickers = gcs.get_tickers()
     if not tickers:
         logging.critical("No tickers loaded. Exiting.")
         return
     
     price_histories = _get_all_price_histories(tickers)
-    plot_thread = threading.Thread(target=_plotter, name="PlotterThread", daemon=True)
-    plot_thread.start()
-
-    count = 0
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(process_ticker, t, price_histories): t for t in tickers}
-        for fut in as_completed(futures):
-            t = futures[fut]
-            try:
-                if fut.result():
-                    count += 1
-            except Exception as e:
-                logging.exception(f"[{t}] Unhandled error in worker: {e}")
     
-    PLOT_QUEUE.join()
-    PLOT_QUEUE.put(None)
-    plot_thread.join()
-    logging.info(f"--- Price Chart Generation Finished. Processed {count} of {len(tickers)} tickers. ---")
+    processed_count = 0
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_ticker = {executor.submit(process_ticker, t, price_histories): t for t in tickers}
+        for future in as_completed(future_to_ticker):
+            ticker = future_to_ticker[future]
+            try:
+                if future.result():
+                    processed_count += 1
+            except Exception as e:
+                logging.exception(f"[{ticker}] Unhandled error in worker: {e}")
+    
+    logging.info(f"--- Price Chart JSON Generation Finished. Processed {processed_count} of {len(tickers)} tickers. ---")

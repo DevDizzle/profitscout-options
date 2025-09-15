@@ -1,6 +1,7 @@
 # ingestion/core/pipelines/options_chain_fetcher.py
 import logging
 import pandas as pd
+import numpy as np  # For any potential calculations, though we'll use SQL where possible
 from datetime import date
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from google.cloud import bigquery
@@ -8,6 +9,7 @@ from .. import config
 from ..clients.polygon import PolygonClient
 
 OPTIONS_TABLE = f"{config.PROJECT_ID}.{config.BIGQUERY_DATASET}.options_chain"
+PRICE_TABLE_ID = f"{config.PROJECT_ID}.{config.BIGQUERY_DATASET}.price_data"  # Assuming based on your schema example
 
 BUY_THRESHOLD = 0.62
 SELL_THRESHOLD = 0.44
@@ -140,6 +142,94 @@ def _coerce_and_align(df: pd.DataFrame, ticker: str, today: date) -> pd.DataFram
     ]
     return df.reindex(columns=cols)
 
+def _compute_and_insert_iv_metrics(bq_client: bigquery.Client, df: pd.DataFrame, ticker: str, today: date):
+    """
+    Computes stock-level IV metrics from the options chain DF and inserts/updates them in price_data.
+    - iv_avg: Average ATM IV for 7-90 DTE contracts.
+    - iv_percentile: Percentile rank over past year (assuming historical iv_avg in price_data).
+    - hv_30: 30-day historical volatility from price_data.
+    - iv_industry_avg: Average IV of industry peers (assume a metadata table with peers; query and avg).
+    - iv_signal: Derived signal (e.g., 'high' if iv_percentile > 50 or iv_avg > hv_30 + 0.10).
+    Uses MERGE to update/insert the row for today.
+    """
+    if df.empty:
+        logging.warning(f"[{ticker}] Empty DF for IV computation.")
+        return
+
+    underlying_price = df['underlying_price'].iloc[0]
+    df['dte'] = (pd.to_datetime(df['expiration_date']) - pd.to_datetime(today)).dt.days
+    atm_df = df[(df['dte'].between(7, 90)) & 
+                (abs(df['strike'] - underlying_price) / underlying_price <= 0.05)]
+
+    if atm_df.empty:
+        logging.warning(f"[{ticker}] No ATM contracts for IV avg.")
+        return
+
+    iv_avg = atm_df['implied_volatility'].mean()
+
+    # Compute HV_30 from price_data (annualized std dev of log returns)
+    hv_query = f"""
+        WITH returns AS (
+            SELECT date, adj_close,
+                   LOG(adj_close / LAG(adj_close) OVER (PARTITION BY ticker ORDER BY date)) AS log_return
+            FROM `{PRICE_TABLE_ID}`
+            WHERE ticker = '{ticker}' AND date >= DATE_SUB('{today}', INTERVAL 30 DAY)
+        )
+        SELECT STDDEV_SAMP(log_return) * SQRT(252) AS hv_30
+        FROM returns
+    """
+    hv_df = bq_client.query(hv_query).to_dataframe()
+    hv_30 = hv_df['hv_30'].iloc[0] if not hv_df.empty and pd.notnull(hv_df['hv_30'].iloc[0]) else None
+
+    # Compute IV percentile from historical iv_avg in price_data (past 252 trading days ~1 year)
+    percentile_query = f"""
+        SELECT PERCENT_RANK() OVER (ORDER BY iv_avg) * 100 AS iv_percentile
+        FROM `{PRICE_TABLE_ID}`
+        WHERE ticker = '{ticker}' AND date >= DATE_SUB('{today}', INTERVAL 365 DAY) AND iv_avg IS NOT NULL
+        ORDER BY date DESC
+        LIMIT 1
+    """
+    percentile_df = bq_client.query(percentile_query).to_dataframe()
+    iv_percentile = percentile_df['iv_percentile'].iloc[0] if not percentile_df.empty else None
+
+    # Compute industry avg IV (assume a stock_metadata table with 'related_tickers' array or similar; avg their iv_avg)
+    # For simplicity, query peers' latest iv_avg; adjust if no table
+    industry_query = f"""
+        WITH peers AS (
+            SELECT STRING_AGG(related_ticker, ',') AS peer_list
+            FROM `{config.PROJECT_ID}.{config.BIGQUERY_DATASET}.stock_metadata`  -- Assume table with peers
+            WHERE ticker = '{ticker}'
+        ),
+        peer_iv AS (
+            SELECT AVG(p.iv_avg) AS iv_industry_avg
+            FROM UNNEST(SPLIT((SELECT peer_list FROM peers), ',')) AS peer_ticker
+            JOIN `{PRICE_TABLE_ID}` p ON p.ticker = peer_ticker AND p.date = (SELECT MAX(date) FROM `{PRICE_TABLE_ID}` WHERE ticker = peer_ticker)
+        )
+        SELECT iv_industry_avg FROM peer_iv
+    """
+    industry_df = bq_client.query(industry_query).to_dataframe()
+    iv_industry_avg = industry_df['iv_industry_avg'].iloc[0] if not industry_df.empty else None
+
+    # Derive signal
+    iv_signal = 'high' if (iv_percentile and iv_percentile > 50) or (hv_30 and iv_avg > hv_30 + 0.10) else 'low'
+
+    # MERGE into price_data
+    merge_q = f"""
+        MERGE `{PRICE_TABLE_ID}` T
+        USING (SELECT '{ticker}' AS ticker, DATE('{today}') AS date, {iv_avg or 'NULL'} AS iv_avg, 
+               {hv_30 or 'NULL'} AS hv_30, {iv_percentile or 'NULL'} AS iv_percentile, 
+               {iv_industry_avg or 'NULL'} AS iv_industry_avg, '{iv_signal}' AS iv_signal)
+        S ON T.ticker = S.ticker AND T.date = S.date
+        WHEN MATCHED THEN
+            UPDATE SET iv_avg = S.iv_avg, hv_30 = S.hv_30, iv_percentile = S.iv_percentile, 
+                       iv_industry_avg = S.iv_industry_avg, iv_signal = S.iv_signal
+        WHEN NOT MATCHED THEN
+            INSERT (ticker, date, iv_avg, hv_30, iv_percentile, iv_industry_avg, iv_signal) 
+            VALUES (S.ticker, S.date, S.iv_avg, S.hv_30, S.iv_percentile, S.iv_industry_avg, S.iv_signal)
+    """
+    bq_client.query(merge_q).result()
+    logging.info(f"[{ticker}] Inserted/updated IV metrics in price_data for {today}.")
+
 
 def _fetch_and_load_chain_for_ticker(
     client: PolygonClient, bq_client: bigquery.Client, ticker: str, signal: str
@@ -157,6 +247,9 @@ def _fetch_and_load_chain_for_ticker(
         return
 
     df = _coerce_and_align(pd.DataFrame(raw), ticker, today)
+
+    # Compute and insert IV metrics before filtering (uses full chain)
+    _compute_and_insert_iv_metrics(bq_client, df, ticker, today)
 
     desired = "call" if signal == "BUY" else "put"
     before = len(df)
