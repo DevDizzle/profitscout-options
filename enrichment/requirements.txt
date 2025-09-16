@@ -1,3 +1,4 @@
+# enrichment/requirements.txt
 functions-framework
 google-cloud-storage
 google-cloud-bigquery
@@ -7,3 +8,4 @@ pandas
 pyarrow
 db-dtypes
 requests
+pandas-ta
