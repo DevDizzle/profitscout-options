@@ -4,3 +4,4 @@ requests
 tenacity
 pandas
 db-dtypes
+pandas_gbq
