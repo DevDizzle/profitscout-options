@@ -1,4 +1,4 @@
-# enrichment/core/analysis/options_analysis_helper.py
+# enrichment/core/options_analysis_helper.py
 from __future__ import annotations
 import datetime as dt
 import math
@@ -83,7 +83,8 @@ def _create_staging_table(bq: bigquery.Client) -> str:
         bigquery.SchemaField("open", "FLOAT"), bigquery.SchemaField("high", "FLOAT"),
         bigquery.SchemaField("low", "FLOAT"), bigquery.SchemaField("adj_close", "FLOAT"),
         bigquery.SchemaField("volume", "INT64"), bigquery.SchemaField("iv_avg", "FLOAT"),
-        bigquery.SchemaField("hv_30", "FLOAT"), bigquery.SchemaField("iv_industry_avg", "FLOAT"),
+        bigquery.SchemaField("hv_30", "FLOAT"),
+        # iv_industry_avg is removed from here for now
         bigquery.SchemaField("iv_signal", "STRING"), bigquery.SchemaField("latest_rsi", "FLOAT"),
         bigquery.SchemaField("latest_macd", "FLOAT"), bigquery.SchemaField("latest_sma50", "FLOAT"),
         bigquery.SchemaField("latest_sma200", "FLOAT"),
@@ -125,7 +126,8 @@ def upsert_analysis_rows(bq: bigquery.Client, rows: List[Dict], enrich_ohlcv: bo
     ensure_table_exists(bq)
     norm = [_normalize_row(r) for r in rows]
     if enrich_ohlcv:
-        keys, ohlcv = [{"ticker": r["ticker"], "date": r["date"]} for r in norm], _fetch_ohlcv_for_keys(bq, keys)
+        keys = [{"ticker": r["ticker"], "date": r["date"]} for r in norm]
+        ohlcv = _fetch_ohlcv_for_keys(bq, keys)
         for r in norm:
             if (k := (r["ticker"], r["date"])) in ohlcv:
                 r.update(ohlcv[k])
@@ -149,6 +151,7 @@ def compute_iv_avg_atm(full_chain_df: pd.DataFrame, underlying_price: Optional[f
     return _safe_float(atm_df["implied_volatility"].mean())
 
 def _fetch_history_for_technicals(bq: bigquery.Client, ticker: str, as_of: dt.date) -> pd.DataFrame:
+    # Increased interval to 400 to ensure enough data for 90-day deltas after SMA200 calculation
     q = f"""
         SELECT date, open, high, low, adj_close AS close, volume
         FROM `{PRICE_TABLE_ID}`
@@ -195,45 +198,31 @@ def compute_technicals_and_deltas(price_hist: pd.DataFrame) -> Dict[str, Optiona
     except Exception: pass
     return out
 
-def compute_hv30(bq: bigquery.Client, ticker: str, as_of: dt.date) -> Optional[float]:
-    q = f"""
-        WITH returns AS (
-            SELECT LOG(adj_close / LAG(adj_close) OVER (ORDER BY date)) AS lr
+def compute_hv30(bq: bigquery.Client, ticker: str, as_of: dt.date, price_history_df: pd.DataFrame = None) -> Optional[float]:
+    """
+    Calculates 30-day historical volatility.
+    Accepts a pre-fetched DataFrame to avoid re-querying.
+    """
+    df_to_use = price_history_df
+    if df_to_use is None:
+        q = f"""
+            SELECT date, adj_close
             FROM `{PRICE_TABLE_ID}`
-            WHERE ticker = @ticker AND date > DATE_SUB(@as_of, INTERVAL 31 DAY) AND date <= @as_of
-        )
-        SELECT STDDEV_SAMP(lr) * SQRT(252) AS hv_30 FROM returns
-    """
-    params = [bigquery.ScalarQueryParameter("ticker", "STRING", ticker),
-              bigquery.ScalarQueryParameter("as_of", "DATE", str(as_of))]
-    df = bq.query(q, job_config=bigquery.QueryJobConfig(query_parameters=params)).to_dataframe()
-    if df.empty or pd.isna(df["hv_30"].iloc[0]): return None
-    return _safe_float(df["hv_30"].iloc[0])
-
-def compute_iv_industry_avg(bq: bigquery.Client, ticker: str, as_of: dt.date) -> Optional[float]:
-    peer_q = f"""
-        WITH me AS (SELECT industry, sector FROM `{META_TABLE_ID}` WHERE ticker = @ticker LIMIT 1),
-        peers AS (
-            SELECT m.ticker FROM `{META_TABLE_ID}` m, me
-            WHERE (me.industry IS NOT NULL AND m.industry = me.industry) OR
-                  (me.industry IS NULL AND me.sector IS NOT NULL AND m.sector = me.sector)
-        ),
-        latest AS (
-            SELECT a.ticker, a.iv_avg FROM `{TARGET_TABLE_ID}` a JOIN peers p USING (ticker)
-            WHERE a.date = @as_of AND a.iv_avg IS NOT NULL
-        )
-        SELECT AVG(iv_avg) AS iv_industry_avg FROM latest WHERE ticker != @ticker
-    """
-    params = [bigquery.ScalarQueryParameter("ticker", "STRING", ticker),
-              bigquery.ScalarQueryParameter("as_of", "DATE", str(as_of))]
-    df = bq.query(peer_q, job_config=bigquery.QueryJobConfig(query_parameters=params)).to_dataframe()
-    if not df.empty and pd.notnull(df["iv_industry_avg"].iloc[0]):
-        return float(df["iv_industry_avg"].iloc[0])
-    market_q = f"SELECT AVG(iv_avg) AS iv_industry_avg FROM `{TARGET_TABLE_ID}` WHERE date = @as_of AND iv_avg IS NOT NULL AND ticker != @ticker"
-    df2 = bq.query(market_q, job_config=bigquery.QueryJobConfig(query_parameters=params)).to_dataframe()
-    if not df2.empty and pd.notnull(df2["iv_industry_avg"].iloc[0]):
-        return float(df2["iv_industry_avg"].iloc[0])
-    return None
+            WHERE ticker = @ticker AND date > DATE_SUB(@as_of, INTERVAL 45 DAY) AND date <= @as_of
+            ORDER BY date
+        """
+        params = [bigquery.ScalarQueryParameter("ticker", "STRING", ticker),
+                  bigquery.ScalarQueryParameter("as_of", "DATE", str(as_of))]
+        df_to_use = bq.query(q, job_config=bigquery.QueryJobConfig(query_parameters=params)).to_dataframe()
+    
+    if df_to_use.empty or len(df_to_use) < 2:
+        return None
+        
+    df_to_use['log_return'] = np.log(df_to_use['adj_close'] / df_to_use['adj_close'].shift(1))
+    std_dev = df_to_use['log_return'].std()
+    
+    # Annualize the standard deviation
+    return _safe_float(std_dev * np.sqrt(252))
 
 def build_and_upsert_for_ticker(bq: bigquery.Client, ticker: str, snapshot_date: dt.date, full_chain_df: pd.DataFrame) -> None:
     uprice = None
@@ -248,35 +237,13 @@ def build_and_upsert_for_ticker(bq: bigquery.Client, ticker: str, snapshot_date:
     if iv_avg is not None and hv_30 is not None:
         try: iv_signal = "high" if iv_avg > (hv_30 + 0.10) else "low"
         except Exception: pass
-    iv_industry_avg = compute_iv_industry_avg(bq, ticker, snapshot_date)
+    
+    # iv_industry_avg is removed from here for now
     row = {"ticker": ticker, "date": snapshot_date, "iv_avg": iv_avg, "hv_30": hv_30,
-           "iv_signal": iv_signal, "iv_industry_avg": iv_industry_avg, **tech}
+           "iv_signal": iv_signal, **tech}
     upsert_analysis_rows(bq, [row], enrich_ohlcv=True)
 
 def backfill_iv_industry_avg_for_date(bq: bigquery.Client, run_date: Optional[dt.date] = None) -> None:
     """After all tickers for a day are upserted, recompute iv_industry_avg consistently."""
-    run_date = run_date or dt.date.today()
-    sql = f"""
-    DECLARE run_date DATE DEFAULT @run_date;
-    MERGE `{TARGET_TABLE_ID}` T USING (
-        WITH latest AS (
-            SELECT a.ticker, a.date, a.iv_avg, m.industry, m.sector
-            FROM `{TARGET_TABLE_ID}` a LEFT JOIN `{META_TABLE_ID}` m ON a.ticker = m.ticker
-            WHERE a.date = run_date
-        ),
-        peers AS (
-            SELECT l1.ticker, AVG(l2.iv_avg) AS peer_avg
-            FROM latest l1 JOIN latest l2 ON l1.ticker != l2.ticker
-            AND ((l1.industry IS NOT NULL AND l2.industry = l1.industry) OR
-                 (l1.industry IS NULL AND l1.sector IS NOT NULL AND l2.sector = l1.sector) OR
-                 (l1.industry IS NULL AND l1.sector IS NULL))
-            WHERE l2.iv_avg IS NOT NULL GROUP BY l1.ticker
-        ),
-        market AS (SELECT AVG(iv_avg) AS mkt_avg FROM latest WHERE iv_avg IS NOT NULL)
-        SELECT l.ticker, l.date, COALESCE(p.peer_avg, m.mkt_avg) AS new_iv_industry_avg
-        FROM latest l LEFT JOIN peers p ON p.ticker = l.ticker CROSS JOIN market m
-    ) S ON T.ticker = S.ticker AND T.date = S.date
-    WHEN MATCHED THEN UPDATE SET T.iv_industry_avg = S.new_iv_industry_avg
-    """
-    bq.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=[
-        bigquery.ScalarQueryParameter("run_date", "DATE", str(run_date))])).result()
+    # This function is now a no-op but kept for structural integrity.
+    pass

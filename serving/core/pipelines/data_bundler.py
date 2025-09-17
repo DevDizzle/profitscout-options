@@ -11,7 +11,6 @@ from .. import config, bq, gcs
 def _copy_blob(blob, source_bucket, destination_bucket, overwrite: bool = False):
     """
     Worker function to copy a single blob.
-    If overwrite is False, it will skip if the blob already exists.
     """
     try:
         destination_blob = destination_bucket.blob(blob.name)
@@ -36,14 +35,14 @@ def _copy_blob(blob, source_bucket, destination_bucket, overwrite: bool = False)
 def _sync_gcs_data():
     """
     Copies all necessary asset files from the source to the destination bucket.
-    It will always overwrite files in the 'technicals/' folder.
     """
     storage_client = storage.Client()
     source_bucket = storage_client.bucket(config.GCS_BUCKET_NAME, user_project=config.SOURCE_PROJECT_ID)
     destination_bucket = storage_client.bucket(config.DESTINATION_GCS_BUCKET_NAME, user_project=config.DESTINATION_PROJECT_ID)
     
+    # --- THIS IS THE MODIFIED SECTION ---
     prefixes_to_sync = [
-        "90-Day-Chart/", "Revenue-Chart/", "Momentum-Chart/", # <-- ADDED CHART FOLDERS
+        "price-chart-json/", # <-- ADDED
         "sec-business/", "headline-news/", "sec-mda/",
         "financial-statements/", "earnings-call-transcripts/",
         "recommendations/", "pages/", "dashboards/", "images/",
@@ -55,21 +54,18 @@ def _sync_gcs_data():
     
     copied_count = 0
     with ThreadPoolExecutor(max_workers=config.MAX_WORKERS_BUNDLER) as executor:
-        # Submit jobs for regular sync (no overwrite)
         blobs_to_sync = [blob for prefix in prefixes_to_sync for blob in source_bucket.list_blobs(prefix=prefix)]
         future_to_blob_sync = {
             executor.submit(_copy_blob, blob, source_bucket, destination_bucket, overwrite=False): blob 
             for blob in blobs_to_sync
         }
         
-        # Submit jobs for overwrite sync
         blobs_to_overwrite = [blob for prefix in prefixes_to_overwrite for blob in source_bucket.list_blobs(prefix=prefix)]
         future_to_blob_overwrite = {
             executor.submit(_copy_blob, blob, source_bucket, destination_bucket, overwrite=True): blob
             for blob in blobs_to_overwrite
         }
         
-        # Process results from both sets of futures
         for future in as_completed({**future_to_blob_sync, **future_to_blob_overwrite}):
             if future.result():
                 copied_count += 1
@@ -77,6 +73,7 @@ def _sync_gcs_data():
     logging.info(f"GCS data sync finished. Copied or overwrote {copied_count} files.")
 
 
+# ... (The rest of the file remains the same) ...
 def _get_latest_daily_files_map() -> Dict[str, Dict[str, str]]:
     """Lists daily files from GCS once and creates a map of the latest file URI for each ticker."""
     storage_client = storage.Client()
