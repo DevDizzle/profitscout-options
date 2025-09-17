@@ -19,8 +19,8 @@ def _insert_candidates(bq: bigquery.Client):
       • Chain source = latest fetch_date per ticker from options_chain
       • Resolve underlying price with latest adj_close from price_data (max date)
       • Moneyness (direction-aware):
-          - Calls: strike / price in [1.05, 1.10]
-          - Puts : price / strike in [1.05, 1.10]
+            - Calls: strike / price in [1.05, 1.10]
+            - Puts : price / strike in [1.05, 1.10]
       • Keep DTE, OI, spread filters
       • Score/normalize as before
       • Compute rn (per ticker, option_type) but DO NOT filter by rn
@@ -84,7 +84,6 @@ def _insert_candidates(bq: bigquery.Client):
     enriched AS (
       SELECT
         b.*,
-        DATE_DIFF(b.expiration_date, b.fetch_date, DAY) AS dte,
         SAFE_DIVIDE(b.ask - b.bid, NULLIF(b.mid_px, 0)) AS spread_pct,
         COALESCE(b.open_interest, 0) AS oi_nz,
         COALESCE(b.volume, 0) AS vol_nz,
@@ -95,14 +94,15 @@ def _insert_candidates(bq: bigquery.Client):
     filtered AS (
       SELECT e.*,
              CASE WHEN e.option_type_lc = 'call' THEN 'BUY' ELSE 'SELL' END AS signal
-      FROM enriched e, params p
+      FROM enriched e
+      CROSS JOIN params p -- <<< THIS IS THE FIX: Changed to explicit CROSS JOIN
       WHERE e.dte BETWEEN p.min_dte AND p.max_dte
         AND (
-             (e.option_type_lc = 'call'
-              AND e.mny_call BETWEEN p.min_mny_call AND p.max_mny_call)
-          OR (e.option_type_lc = 'put'
-              AND e.mny_put  BETWEEN p.min_mny_put  AND p.max_mny_put)
-        )
+              (e.option_type_lc = 'call'
+               AND e.mny_call BETWEEN p.min_mny_call AND p.max_mny_call)
+           OR (e.option_type_lc = 'put'
+               AND e.mny_put  BETWEEN p.min_mny_put  AND p.max_mny_put)
+         )
         AND e.oi_nz >= p.min_oi
         AND e.spread_pct IS NOT NULL AND e.spread_pct <= p.max_spread
     ),
@@ -125,7 +125,7 @@ def _insert_candidates(bq: bigquery.Client):
         SAFE_DIVIDE(
           (LOG10(1 + vol_nz) + LOG10(1 + oi_nz))
           - MIN((LOG10(1 + vol_nz) + LOG10(1 + oi_nz)))
-              OVER (PARTITION BY ticker, option_type_lc),
+            OVER (PARTITION BY ticker, option_type_lc),
           NULLIF(
             MAX((LOG10(1 + vol_nz) + LOG10(1 + oi_nz)))
               OVER (PARTITION BY ticker, option_type_lc)

@@ -4,10 +4,7 @@ import logging
 from core.pipelines import (
     page_generator,
     price_chart_generator,
-    revenue_chart_generator,
-    momentum_chart_generator,
     data_bundler,
-    recommendations_generator,
     sync_to_firestore,
     data_cruncher, 
     dashboard_generator,
@@ -57,24 +54,9 @@ def run_price_chart_generator(request):
     return "Price chart generator pipeline finished.", 200
 
 @functions_framework.http
-def run_revenue_chart_generator(request):
-    revenue_chart_generator.run_pipeline()
-    return "Revenue chart generator pipeline finished.", 200
-
-@functions_framework.http
-def run_momentum_chart_generator(request):
-    momentum_chart_generator.run_pipeline()
-    return "Momentum chart generator pipeline finished.", 200
-
-@functions_framework.http
 def run_data_bundler(request):
     data_bundler.run_pipeline()
     return "Data bundler pipeline finished.", 200
-
-@functions_framework.http
-def run_recommendations_generator(request):
-    recommendations_generator.run_pipeline()
-    return "Recommendations generator pipeline finished.", 200
 
 @functions_framework.http
 def run_sync_to_firestore(request):

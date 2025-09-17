@@ -242,7 +242,8 @@ def build_and_upsert_for_ticker(bq: bigquery.Client, ticker: str, snapshot_date:
         if not u.empty: uprice = float(u.iloc[0])
     if uprice is None: uprice = _spot_on_or_before(bq, ticker, snapshot_date)
     iv_avg, hv_30 = compute_iv_avg_atm(full_chain_df, uprice, snapshot_date) if uprice else None, compute_hv30(bq, ticker, snapshot_date)
-    hist, tech = _fetch_history_for_technicals(bq, ticker, snapshot_date), compute_technicals_and_deltas(hist)
+    hist = _fetch_history_for_technicals(bq, ticker, snapshot_date)
+    tech = compute_technicals_and_deltas(hist)
     iv_signal = None
     if iv_avg is not None and hv_30 is not None:
         try: iv_signal = "high" if iv_avg > (hv_30 + 0.10) else "low"

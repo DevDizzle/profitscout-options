@@ -85,16 +85,16 @@ def _generate_price_chart_json(ticker: str, price_df: pd.DataFrame) -> str | Non
             for row in plot_df.itertuples()
         ],
         "volume": [
-            {"date": row.date.strftime('%Y-%m-%d'), "value": row.volume}
+            {"date": row.date.strftime('%Y-%m-%d'), "value": int(row.volume)}
             for row in plot_df.itertuples()
         ],
         "sma50": [
             {"date": row.date.strftime('%Y-%m-%d'), "value": row.sma_50}
-            for row in plot_df.itertuples() if "sma_50" in row and pd.notna(row.sma_50)
+            for row in plot_df.itertuples() if hasattr(row, 'sma_50') and pd.notna(row.sma_50)
         ],
         "sma200": [
             {"date": row.date.strftime('%Y-%m-%d'), "value": row.sma_200}
-            for row in plot_df.itertuples() if "sma_200" in row and pd.notna(row.sma_200)
+            for row in plot_df.itertuples() if hasattr(row, 'sma_200') and pd.notna(row.sma_200)
         ],
     }
     

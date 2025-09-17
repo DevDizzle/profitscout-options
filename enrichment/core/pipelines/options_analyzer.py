@@ -1,183 +1,212 @@
 import logging
-import pandas as pd
+import re
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import pandas as pd
 from google.cloud import bigquery
 from .. import config, gcs
 from ..clients import vertex_ai
 
-OUTPUT_PREFIX = "options-analysis/"
+OUTPUT_PREFIX = "options-analysis/contracts/"
+MIN_SCORE = 0.50
+MAX_WORKERS = 16
 
-# --- Updated example generated, now selecting one best contract per ticker with reasoning ---
+# --- Example output: explicit contract-level decision ---
 _EXAMPLE_OUTPUT = """{
-  "selected_contract": {
+  "decision": "BUY",
+  "strategy": "PUT",
+  "contract": {
     "ticker": "MIDD",
+    "option_type": "put",
     "expiration_date": "2025-10-18",
-    "strike": 150.0
+    "strike": 150.0,
+    "contract_symbol": "MIDD251018P00150000"
   },
-  "analysis": "For MIDD's SELL signal, the selected put at 150 strike (exp 2025-10-18) stands out with 5.2% OTM, 28 DTE for balanced decay, and superior liquidity (OI 2,500, vol 1,200) vs. alternatives. Theta -0.03 minimizes time risk, vega 0.14 captures IV spikes (current 42%, 65th percentile > HV_30 32%), and delta -0.45 offers leverage on downside. Aligns with 30d close delta -7.5% and RSI 32 (30d delta -10, oversold). MACD negative crossover reinforces bearish bias over 90d trends.",
-  "reasoning": "Chose this over the 145 strike (too deep OTM, low delta 0.3, poor liquidity OI 800) and 155 strike (higher theta risk -0.05, IV misalignment) because it balances leverage, liquidity, and technical fit—exceptional for 25% ROI on 4% drop vs. peers' 15%."
+  "analysis": "This contract is a strong candidate because its bearish direction aligns with the overall SELL signal. The implied volatility is elevated relative to its historical volatility and industry peers, suggesting the premium is rich, which is favorable for selling puts or buying puts. The technicals are also supportive, with the MACD trending down and the price below its key moving averages.",
+  "reasoning": "The decision to BUY is based on the combination of a clear bearish signal, favorable volatility dynamics, and supportive technical indicators. The contract has good liquidity and the strike price is at a reasonable out-of-the-money level."
 }"""
 
+# --- Prompt: single-contract verdict (BUY / NO_BUY) ---
 _PROMPT_TEMPLATE = r"""
-You are a sharp financial analyst specializing in equity options. Your task is to evaluate multiple viable option contracts for a ticker, incorporating enriched price and technical data, then select the single best one with reasoning.
-Use **only** the JSON data provided (array of contracts + shared enriched fields).
+You are an options analyst. Your task is to decide whether to BUY or NO_BUY a single options contract based on the provided JSON data. The JSON contains the contract's details and enriched data for the underlying ticker.
 
-### Key Interpretation Guidelines
-1.  **Compare & Select**: Evaluate all contracts on alignment with signal (BUY/SELL = CALL/PUT), moneyness/leverage, liquidity (OI/volume/spread), risks (theta/vega), IV context (avg/percentile/HV/industry/signal), and technicals (RSI/MACD/SMAs + 30d/90d deltas for momentum).
-2.  **Best Criteria**: Prioritize: High options_score, good liquidity, optimal DTE (15-45 for balance), delta ~0.4-0.6 for leverage, low theta risk, IV favoring direction (low percentile for buys, high for sells). Use 30d deltas for near-term timing, 90d for trend confirmation.
-3.  **Value Add**: Estimate ROI scenarios (e.g., on 5% stock move), suggest strategy tweaks (e.g., pair with stock), highlight edges from technicals (e.g., SMA crossover + price delta).
+### Analysis Guidelines:
+- **Directional Alignment**: If the `signal` is "BUY", you should favor CALL options. If the `signal` is "SELL", you should favor PUT options.
+- **Liquidity**: High open interest and volume are good. A `spread_pct` greater than 10% is a red flag.
+- **Greeks**: A `delta` between 0.35 and 0.60 is ideal for leverage. High `theta` indicates rapid time decay. `Vega` shows sensitivity to volatility.
+- **Volatility**: Compare `iv_avg` to `hv_30` and `iv_industry_avg`. A low `iv_avg` suggests the option is cheap (good for buying), while a high `iv_avg` suggests it's expensive.
+- **Technicals**: Use RSI, MACD, and SMAs to confirm the trend. The 30-day and 90-day deltas indicate momentum.
 
-### Step-by-Step Reasoning
-1.  Assess each contract's strengths/weaknesses relative to others.
-2.  Select one best overall, explaining why it outperforms alternatives (e.g., better IV alignment + liquidity).
-3.  Provide dense analysis for the selected, plus separate reasoning comparing to others.
+### Output Instructions:
+- Your response must be a JSON object with the following structure:
+  - `decision`: "BUY" or "NO_BUY".
+  - `strategy`: "CALL" or "PUT".
+  - `contract`: A dictionary with `ticker`, `option_type`, `expiration_date`, `strike`, and `contract_symbol`.
+  - `analysis`: A 100–150 word justification for your decision.
+  - `reasoning`: A 50–100 word explanation of why this contract is or isn't a good trade.
 
-### Output — return exactly this JSON, nothing else
-{
-  "selected_contract": {
-    "ticker": "<ticker string>",
-    "expiration_date": "<YYYY-MM-DD from selected>",
-    "strike": <float from selected>
-  },
-  "analysis": "<One dense paragraph (100-150 words) on the selected trade idea, integrating liquidity, risks, IV, technicals, and signal alignment. Include ROI estimates.>",
-  "reasoning": "<Concise paragraph (50-100 words) explaining why this over others, citing key diffs in score, Greeks, technicals, etc.>"
-}
-
-### Example Output (for format only; do not copy wording)
+### Example Output (for format only):
 {example_output}
 
 ### Provided data:
 {contract_data}
 """
 
-def _get_options_work_list() -> dict[str, pd.DataFrame]:
+def _slug(s: str) -> str:
+    """Creates a safe filename for GCS."""
+    return re.sub(r"[^a-zA-Z0-9._-]+", "-", s)[:200]
+
+def _fetch_candidates_all() -> pd.DataFrame:
     """
-    Fetches all of today's options candidates from BigQuery, joined with enriched max_date data from price_data.
-    Returns a dict of ticker: sub-DF for grouped processing.
+    Fetches all candidates from the last 24 hours that meet the minimum score,
+    and joins them with same-day features from options_analysis_input.
     """
     client = bigquery.Client(project=config.PROJECT_ID)
+    project = config.PROJECT_ID
+    dataset = config.BIGQUERY_DATASET
+
     query = f"""
-        WITH latest_price AS (
-            SELECT ticker, MAX(date) AS max_date
-            FROM `{config.PROJECT_ID}.{config.BIGQUERY_DATASET}.price_data`
-            GROUP BY ticker
-        )
-        SELECT
-            c.*,
-            s.company_name,
-            p.open AS underlying_open,
-            p.high AS underlying_high,
-            p.low AS underlying_low,
-            p.adj_close AS underlying_adj_close,
-            p.volume AS underlying_volume,
-            p.iv_avg,
-            p.hv_30,
-            p.iv_percentile,
-            p.iv_industry_avg,
-            p.iv_signal,
-            p.latest_rsi,
-            p.latest_macd,
-            p.latest_sma50,
-            p.latest_sma200,
-            p.close_30d_delta_pct,
-            p.rsi_30d_delta,
-            p.macd_30d_delta,
-            p.close_90d_delta_pct,
-            p.rsi_90d_delta,
-            p.macd_90d_delta
-        FROM `{config.CAND_TABLE}` AS c
-        JOIN (
-            SELECT ticker, company_name, ROW_NUMBER() OVER(PARTITION BY ticker ORDER BY quarter_end_date DESC) as rn
-            FROM `{config.PROJECT_ID}.{config.BIGQUERY_DATASET}.stock_metadata`
-        ) AS s ON c.ticker = s.ticker AND s.rn = 1
-        JOIN latest_price lp ON c.ticker = lp.ticker
-        JOIN `{config.PROJECT_ID}.{config.BIGQUERY_DATASET}.price_data` p 
-            ON lp.ticker = p.ticker AND lp.max_date = p.date
-        WHERE c.selection_run_ts >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
-          AND c.options_score >= 0.5
-        ORDER BY c.ticker, c.options_score DESC
+    WITH candidates AS (
+      SELECT *
+      FROM `{project}.{dataset}.options_candidates`
+      WHERE selection_run_ts >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
+        AND options_score >= {MIN_SCORE}
+    ),
+    analysis AS (
+      SELECT *
+      FROM `{project}.{dataset}.options_analysis_input`
+      WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 2 DAY) -- Look back 2 days for a match
+    )
+    SELECT
+      c.*,
+      a.open AS underlying_open,
+      a.high AS underlying_high,
+      a.low AS underlying_low,
+      a.adj_close AS underlying_adj_close,
+      a.volume AS underlying_volume,
+      a.iv_avg,
+      a.hv_30,
+      a.iv_industry_avg,
+      a.iv_signal,
+      a.latest_rsi,
+      a.latest_macd,
+      a.latest_sma50,
+      a.latest_sma200,
+      a.close_30d_delta_pct,
+      a.rsi_30d_delta,
+      a.macd_30d_delta,
+      a.close_90d_delta_pct,
+      a.rsi_90d_delta,
+      a.macd_90d_delta
+    FROM candidates c
+    JOIN analysis a ON c.ticker = a.ticker AND c.fetch_date = a.date
+    ORDER BY c.ticker, c.options_score DESC
     """
+    df = client.query(query).to_dataframe()
+    # Stringify dates for JSON safety
+    for col in ("selection_run_ts", "expiration_date", "fetch_date"):
+        if col in df.columns:
+            df[col] = df[col].astype(str)
+    return df
+
+def _row_to_llm_payload(row: pd.Series) -> str:
+    """Builds the single-contract JSON payload for the LLM."""
+    contract = {
+        "ticker": row["ticker"],
+        "option_type": str(row["option_type"]).lower(),
+        "expiration_date": row["expiration_date"],
+        "strike": float(row["strike"]) if pd.notna(row["strike"]) else 0.0,
+        "contract_symbol": row.get("contract_symbol", ""),
+        "last_price": row.get("last_price"),
+        "bid": row.get("bid"),
+        "ask": row.get("ask"),
+        "volume": row.get("volume"),
+        "open_interest": row.get("open_interest"),
+        "implied_volatility": row.get("implied_volatility"),
+        "delta": row.get("delta"),
+        "theta": row.get("theta"),
+        "vega": row.get("vega"),
+        "gamma": row.get("gamma"),
+        "options_score": row.get("options_score"),
+    }
+    enriched = {
+        "signal": row.get("signal"),
+        "underlying_open": row.get("underlying_open"),
+        "underlying_high": row.get("underlying_high"),
+        "underlying_low": row.get("underlying_low"),
+        "underlying_adj_close": row.get("underlying_adj_close"),
+        "underlying_volume": row.get("underlying_volume"),
+        "iv_avg": row.get("iv_avg"),
+        "hv_30": row.get("hv_30"),
+        "iv_industry_avg": row.get("iv_industry_avg"),
+        "iv_signal": row.get("iv_signal"),
+        "latest_rsi": row.get("latest_rsi"),
+        "latest_macd": row.get("latest_macd"),
+        "latest_sma50": row.get("latest_sma50"),
+        "latest_sma200": row.get("latest_sma200"),
+        "close_30d_delta_pct": row.get("close_30d_delta_pct"),
+        "rsi_30d_delta": row.get("rsi_30d_delta"),
+        "macd_30d_delta": row.get("macd_30d_delta"),
+        "close_90d_delta_pct": row.get("close_90d_delta_pct"),
+        "rsi_90d_delta": row.get("rsi_90d_delta"),
+        "macd_90d_delta": row.get("macd_90d_delta"),
+    }
+    payload = {
+        "contract": contract,
+        "enriched_data": enriched,
+    }
+    return json.dumps(payload, indent=2)
+
+def _process_contract(row: pd.Series):
+    """Processes a single contract row and generates a BUY/NO_BUY JSON."""
+    ticker = row["ticker"]
+    csym = row.get("contract_symbol") or f"{ticker}_{row['expiration_date']}_{row['strike']}"
+    blob_name = f"{OUTPUT_PREFIX}{_slug(ticker)}/{_slug(csym)}.json"
+
+    prompt = _PROMPT_TEMPLATE.format(
+        example_output=_EXAMPLE_OUTPUT,
+        contract_data=_row_to_llm_payload(row),
+    )
+
     try:
-        df = client.query(query).to_dataframe()
-        # Convert dates/timestamps to strings for JSON
-        if 'selection_run_ts' in df.columns:
-            df['selection_run_ts'] = df['selection_run_ts'].astype(str)
-        if 'expiration_date' in df.columns:
-            df['expiration_date'] = df['expiration_date'].astype(str)
-        if 'fetch_date' in df.columns:
-            df['fetch_date'] = df['fetch_date'].astype(str)
-        if 'max_date' in df.columns:
-            df['max_date'] = df['max_date'].astype(str)
-        
-        # Group by ticker
-        grouped = {ticker: sub_df for ticker, sub_df in df.groupby('ticker')}
-        return grouped
+        resp = vertex_ai.generate(prompt)
+        obj = json.loads(resp)
+
+        if obj.get("decision") not in ("BUY", "NO_BUY"):
+            raise ValueError("Response missing or invalid 'decision'")
+        if "contract" not in obj:
+            raise ValueError("Response missing 'contract' block")
+
+        sc = obj["contract"]
+        sc.setdefault("ticker", ticker)
+        sc.setdefault("option_type", str(row["option_type"]).lower())
+        sc.setdefault("expiration_date", row["expiration_date"])
+        sc.setdefault("strike", float(row["strike"]) if pd.notna(row["strike"]) else 0.0)
+        sc.setdefault("contract_symbol", csym)
+
+        gcs.write_text(config.GCS_BUCKET_NAME, blob_name, json.dumps(obj, indent=2), "application/json")
+        logging.info(f"[{ticker}] Wrote {obj['decision']} to gs://{config.GCS_BUCKET_NAME}/{blob_name}")
+        return blob_name
     except Exception as e:
-        logging.critical(f"Failed to fetch options work list: {e}", exc_info=True)
-        return {}
-
-
-def _process_ticker(ticker: str, contracts_df: pd.DataFrame):
-    """
-    Main worker for a ticker: Sends all contracts + enriched data to LLM, which selects one best with reasoning/analysis.
-    Generates one JSON per ticker.
-    """
-    analysis_blob_path = f"{OUTPUT_PREFIX}{ticker}_best_option_analysis.json"
-    logging.info(f"[{ticker}] Generating best option analysis from {len(contracts_df)} candidates.")
-
-    try:
-        # Prepare data: Array of contracts + shared enriched fields (take first row's enriched since same for ticker)
-        shared_enriched = contracts_df.iloc[0][['underlying_open', 'underlying_high', 'underlying_low', 'underlying_adj_close', 'underlying_volume',
-                                                'iv_avg', 'hv_30', 'iv_percentile', 'iv_industry_avg', 'iv_signal',
-                                                'latest_rsi', 'latest_macd', 'latest_sma50', 'latest_sma200',
-                                                'close_30d_delta_pct', 'rsi_30d_delta', 'macd_30d_delta',
-                                                'close_90d_delta_pct', 'rsi_90d_delta', 'macd_90d_delta']].to_dict()
-        
-        contracts_list = contracts_df.drop(columns=shared_enriched.keys()).to_dict('records')  # Drop duplicates
-        
-        data_dict = {
-            "ticker": ticker,
-            "company_name": contracts_df['company_name'].iloc[0],
-            "contracts": contracts_list,
-            "enriched_data": shared_enriched
-        }
-        
-        contract_json_str = json.dumps(data_dict, indent=2)
-
-        prompt = _PROMPT_TEMPLATE.format(
-            example_output=_EXAMPLE_OUTPUT,
-            contract_data=contract_json_str
-        )
-        
-        analysis_json_str = vertex_ai.generate(prompt)
-
-        # Validate JSON
-        json.loads(analysis_json_str)
-        
-        gcs.write_text(config.GCS_BUCKET_NAME, analysis_blob_path, analysis_json_str, "application/json")
-        
-        logging.info(f"[{ticker}] Successfully generated and wrote best analysis to {analysis_blob_path}")
-        return analysis_blob_path
-
-    except Exception as e:
-        logging.error(f"[{ticker}] Failed during best option analysis generation: {e}", exc_info=True)
+        logging.error(f"[{ticker}] Contract {csym} failed: {e}", exc_info=True)
         return None
 
 def run_pipeline():
-    """Main pipeline for generating per-ticker best-option analysis."""
-    logging.info("--- Starting Options Analysis Pipeline ---")
-    
-    grouped_work = _get_options_work_list()
-    if not grouped_work:
-        logging.warning("No options candidates found to analyze. Exiting.")
+    """
+    Runs the contract-level decisioning pipeline for all candidates.
+    """
+    logging.info("--- Starting Contract Decision Pipeline ---")
+    df = _fetch_candidates_all()
+    if df.empty:
+        logging.warning("No candidate contracts found. Exiting.")
         return
 
-    processed_count = 0
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(_process_ticker, ticker, df): ticker for ticker, df in grouped_work.items()}
-        for future in as_completed(futures):
-            if future.result():
-                processed_count += 1
-                
-    logging.info(f"--- Options Analysis Pipeline Finished. Processed {processed_count} of {len(grouped_work)} tickers. ---")
+    processed = 0
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = [ex.submit(_process_contract, row) for _, row in df.iterrows()]
+        for fut in as_completed(futures):
+            if fut.result():
+                processed += 1
+
+    logging.info(f"--- Finished. Decisions written for {processed}/{len(df)} contracts. ---")
