@@ -1,3 +1,4 @@
+# serving/core/pipelines/recommendations_generator.py
 import logging
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -7,80 +8,52 @@ from ..clients import vertex_ai
 from datetime import date, datetime
 import re
 
-# --- Templates and other top-level definitions remain the same ---
+# --- Updated: New Example reflecting the richer analysis ---
 _EXAMPLE_OUTPUT = """
 # Oracle (ORCL) ☁️
 
-**HOLD** – Bearish technicals clash with a strong long-term AI narrative.
+**Strongly Bullish outlook encountering short-term weakness.**
 
-**Quick take:** While current price action is weak, Oracle's massive order backlog and booming AI demand create a compelling, if complex, long-term picture.
+**Quick take:** While current price action is weak, Oracle's strong fundamentals, driven by booming AI demand and a massive order backlog, create a compelling long-term picture.
 
 ### Profile
 Oracle provides comprehensive enterprise IT solutions, including cloud applications (OCA) and infrastructure (OCI), serving a wide range of global clients.
 
 ### Key Highlights
-- 🚩 Technical indicators suggest a near-term downtrend.
-- 🚩 Price is trading below its key 21-day and 50-day moving averages.
-- ⚖️ Strong AI demand and a massive $455B in future contracts conflict with current price weakness.
-- 📈 Management reports booming demand for AI infrastructure and cloud services.
+- ⚖️ **Conflicting Signals:** The powerful long-term fundamental story is not yet reflected in the current bearish momentum.
+- 📈 Management reports booming demand for AI infrastructure, with Remaining Performance Obligations (RPO) now at $455B.
 - 📈 Recent quarter revenue grew 12%, driven by strong cloud performance.
+- 🚩 Price is trading below its key 21-day and 50-day moving averages, confirming the short-term downtrend.
 - 🚩 Rising debt (now over $105B) and negative free cash flow are key watch items.
 
-Overall: A HOLD is warranted as the powerful fundamental story is not yet reflected in the bearish momentum.
+Overall: A Strongly Bullish outlook is warranted based on fundamentals, but traders should be aware of the negative short-term price momentum.
 
 💡 Help shape the future: share your feedback to guide our next update.
 """
 
+# --- Updated: New Prompt accepting the richer signal context ---
 _PROMPT_TEMPLATE = r"""
 You are a confident but approachable financial analyst writing AI-powered stock recommendations.
-Tone = clear, professional, and concise.
-Think: "Smarter Investing Starts Here" — give users clarity, not noise.
+Your tone should be clear, professional, and concise. Your goal is to give users clarity, not noise.
 
-### Section Mapping
-Map aggregated text sections into these labels (for your internal reasoning; do not print these labels):
-- **Profile** → "About"
-- **News Buzz** → "News Analysis"
-- **Tech Signals** → "Technical Analysis"
-- **Mgmt Chat** → "MD&A Analysis"
-- **Earnings Scoop** → "Transcript Analysis"
-- **Financials** → "Financials Analysis"
-- **Fundamentals** → "Key Metrics Analysis" + "Ratios Analysis"
+### Analysis Rules (Very Important)
+- **Lead with the Primary Outlook**: The `outlook_signal` is your main thesis (e.g., "Strongly Bullish").
+- **Integrate the Momentum Context**: The `momentum_context` tells you if the short-term price trend agrees or disagrees with the main outlook. You MUST reflect this in your analysis. If they conflict, highlight the tension (e.g., "Strong fundamentals are clashing with weak price action.").
+- **Momentum-First Narrative**: Start your "Quick take" and "Key Highlights" with the momentum story (price trends, chart patterns) before discussing fundamentals (earnings, financials).
 
-### Momentum Emphasis (important)
-- Treat this as a **momentum-led** framework (weights tilt toward Technicals + News).
-- Lead the narrative with near-term momentum; fundamentals/financials provide context.
-- If momentum and fundamentals conflict, include a single ⚖️ bullet noting the tension.
-
-### Formatting Rules (strict)
-- Use this layout and spacing exactly:
-  1) H1 line: "# {{company_name}} ({{ticker}}) [Emoji]"
-  2) Bold recommendation line: "**BUY/HOLD/SELL** – short one-liner."
-  3) A blank line, then "**Quick take:**" + 1–2 sentences.
-  4) A blank line, then "### Profile" + 1–2 sentences.
-  5) A blank line, then "### Key Highlights" followed by bullets.
-  6) A blank line, then one sentence "Overall: …"
-  7) A blank line, then a single call-to-action line (no header).
-- Exactly one blank line between every block. No extra blank lines at start or end.
-- **Key Highlights** must be a Markdown bulleted list using dashes (`- `), not numbered lists.
-- **Bullet order (momentum-first):**
-  - First bullet: ⚡ momentum summary (from Technicals/News).
-  - Second bullet: 📈 or 🚩 momentum confirmation (breakouts/trend/breadth/volume).
-  - Remaining bullets: strongest items from Transcript, MD&A, Financials, Fundamentals.
-- Each bullet: start with one emoji (📈 bullish, 🚩 bearish, ⚖️ mixed, ⚡ momentum), then a concise statement (≤ 15 words).
-- Do not include bold subsection labels inside bullets (no "**News Buzz:**", etc.).
-- No additional headings beyond "### Profile" and "### Key Highlights".
-- Total length ≲ 250 words.
-
-### Content Instructions
-1.  **Recommendation**: Strictly "BUY" (> 0.62), "HOLD" (0.44–0.62), or "SELL" (< 0.44). Add a short, confident one-liner that includes the core reason (e.g., "momentum breakout," "fundamental pressure," "technical weakness"). Do not show the raw score.
-2.  **Quick Take**: 1–2 sentences summarizing the overall outlook, leading with momentum. Be specific. Instead of "supportive headlines," say "positive inflation data."
-3.  **Profile**: Summarize the "About" text in **1–2 sentences**.
-4.  **Highlights**: Convert mapped analyses into concise emoji bullets. Each bullet must be a data-driven insight. **Cite specific numbers, trends, or named catalysts** from the input text (e.g., 'Revenue grew 12%,' 'Price broke the 50-day MA,' 'RPO now at $455B'). AVOID vague statements like "Fundamentals are improving."
-5.  **Wrap-Up**: End with one sentence ("Overall: ...") that concisely reconciles the momentum view with the fundamental context.
-6.  **Engagement Hook**: Close with a single call-to-action that encourages feedback.
+### Formatting Rules (Strict)
+- Use this layout and spacing exactly.
+- **H1 line**: `# {{company_name}} ({{ticker}}) [Emoji]`
+- **Bold Outlook Line**: A single bolded line combining the `outlook_signal` and `momentum_context`.
+- **Quick Take**: 1-2 sentences summarizing the overall outlook, leading with the momentum vs. fundamental picture.
+- **Profile & Key Highlights**: Use "### Profile" and "### Key Highlights" headers.
+- **Bullets**: Use Markdown dashes (`- `). Start each bullet with one emoji (📈 bullish, 🚩 bearish, ⚖️ mixed/conflicting). Each bullet must be a concise, data-driven insight from the input text. Cite specific numbers and trends.
+- **Overall**: One sentence that reconciles the momentum view with the fundamental context.
+- **Hook**: Close with a single call-to-action encouraging feedback.
 
 ### Input Data
-- **Weighted Score**: {weighted_score}
+- **Outlook Signal**: {outlook_signal}
+- **Momentum Context**: {momentum_context}
 - **Aggregated Analysis Text**:
 {aggregated_text}
 
@@ -88,105 +61,108 @@ Map aggregated text sections into these labels (for your internal reasoning; do 
 {example_output}
 """
 
-def _get_all_last_gen_dates() -> dict[str, date]:
+def _get_signal_and_context(score: float, momentum_pct: float | None) -> tuple[str, str]:
     """
-    Efficiently gets the last generation date for all tickers by listing blobs once.
+    Determines the 5-tier outlook signal and the momentum context.
     """
-    prefix = config.RECOMMENDATION_PREFIX
-    blobs = gcs.list_blobs(config.GCS_BUCKET_NAME, prefix)
-    date_regex = re.compile(r'([A-Z\.]+)_recommendation_(\d{4}-\d{2}-\d{2})\.md$')
-    last_dates = {}
+    # 1. Determine the primary outlook signal based on score
+    if score > 0.75:
+        outlook = "Strongly Bullish"
+    elif 0.60 <= score <= 0.74:
+        outlook = "Moderately Bullish"
+    elif 0.40 <= score <= 0.59:
+        outlook = "Neutral / Mixed"
+    elif 0.25 <= score <= 0.39:
+        outlook = "Moderately Bearish"
+    else: # score < 0.25
+        outlook = "Strongly Bearish"
 
-    for blob_name in blobs:
-        match = date_regex.search(blob_name)
-        if match:
-            ticker, date_str = match.groups()
-            try:
-                blob_date = datetime.strptime(date_str, '%Y-%m-%d').date()
-                if ticker not in last_dates or blob_date > last_dates[ticker]:
-                    last_dates[ticker] = blob_date
-            except ValueError:
-                continue
-    return last_dates
+    # 2. Determine the momentum context
+    context = ""
+    if momentum_pct is not None:
+        is_bullish_outlook = "Bullish" in outlook
+        is_bearish_outlook = "Bearish" in outlook
+
+        if is_bullish_outlook and momentum_pct > 0:
+            context = "with confirming positive momentum."
+        elif is_bullish_outlook and momentum_pct < 0:
+            context = "encountering short-term weakness."
+        elif is_bearish_outlook and momentum_pct < 0:
+            context = "with confirming negative momentum."
+        elif is_bearish_outlook and momentum_pct > 0:
+            context = "encountering a short-term rally."
+
+    return outlook, context
+
 
 def _get_daily_work_list() -> list[dict]:
     """
-    Builds the list of tickers that need processing for the day.
+    Builds the list of tickers to process, now including 30-day momentum.
     """
     client = bigquery.Client(project=config.SOURCE_PROJECT_ID)
     today_iso = date.today().isoformat()
     
-    today_scores_query = f"""
-        WITH LatestMetadata AS (
+    # NEW: Join with options_analysis_input to get the momentum data
+    query = f"""
+        WITH LatestScores AS (
             SELECT 
                 ticker,
                 company_name,
-                ROW_NUMBER() OVER(PARTITION BY ticker ORDER BY quarter_end_date DESC) as rn
-            FROM `{config.BUNDLER_STOCK_METADATA_TABLE_ID}`
+                weighted_score,
+                aggregated_text,
+                run_date
+            FROM (
+                SELECT 
+                    t1.ticker,
+                    t2.company_name,
+                    t1.weighted_score,
+                    t1.aggregated_text,
+                    t1.run_date,
+                    ROW_NUMBER() OVER(PARTITION BY t1.ticker ORDER BY t1.run_date DESC) as rn_score,
+                    ROW_NUMBER() OVER(PARTITION BY t1.ticker ORDER BY t2.quarter_end_date DESC) as rn_meta
+                FROM `{config.SCORES_TABLE_ID}` AS t1
+                LEFT JOIN `{config.BUNDLER_STOCK_METADATA_TABLE_ID}` AS t2 
+                    ON t1.ticker = t2.ticker
+                WHERE t1.run_date = '{today_iso}' AND t1.weighted_score IS NOT NULL
+            )
+            WHERE rn_score = 1 AND rn_meta = 1
+        ),
+        Momentum AS (
+            SELECT
+                ticker,
+                close_30d_delta_pct
+            FROM (
+                SELECT 
+                    ticker,
+                    close_30d_delta_pct,
+                    ROW_NUMBER() OVER(PARTITION BY ticker ORDER BY date DESC) as rn
+                FROM `{config.SOURCE_PROJECT_ID}.{config.BIGQUERY_DATASET}.options_analysis_input`
+            )
+            WHERE rn = 1
         )
-        SELECT 
-            t1.ticker, 
-            t1.weighted_score, 
-            t1.aggregated_text,
-            t2.company_name
-        FROM `{config.SCORES_TABLE_ID}` AS t1
-        LEFT JOIN LatestMetadata AS t2 ON t1.ticker = t2.ticker AND t2.rn = 1
-        WHERE t1.run_date = '{today_iso}' AND t1.weighted_score IS NOT NULL
+        SELECT
+            s.ticker,
+            s.company_name,
+            s.weighted_score,
+            s.aggregated_text,
+            m.close_30d_delta_pct
+        FROM LatestScores s
+        LEFT JOIN Momentum m ON s.ticker = m.ticker
     """
+
     try:
-        today_df = client.query(today_scores_query).to_dataframe()
-        if today_df.empty: return []
+        df = client.query(query).to_dataframe()
+        if df.empty:
+            logging.warning("No tickers found in daily work list. Exiting.")
+            return []
+        return df.to_dict('records')
     except Exception as e:
-        logging.critical(f"Failed to fetch today's scores: {e}", exc_info=True)
+        logging.critical(f"Failed to build daily work list: {e}", exc_info=True)
         return []
 
-    prev_scores_query = f"""
-        WITH RankedScores AS (
-            SELECT ticker, weighted_score, ROW_NUMBER() OVER(PARTITION BY ticker ORDER BY run_date DESC) as rn
-            FROM `{config.SCORES_TABLE_ID}`
-            WHERE run_date < '{today_iso}' AND weighted_score IS NOT NULL
-        )
-        SELECT ticker, weighted_score AS prev_weighted_score FROM RankedScores WHERE rn = 1
-    """
-    try:
-        prev_df = client.query(prev_scores_query).to_dataframe()
-    except Exception:
-        prev_df = pd.DataFrame(columns=['ticker', 'prev_weighted_score'])
-
-    merged_df = pd.merge(today_df, prev_df, on="ticker", how="left")
-    
-    merged_df['score_diff'] = (merged_df['weighted_score'] - merged_df['prev_weighted_score']).abs()
-    merged_df['needs_new_text'] = (merged_df['score_diff'] >= 0.02) | (merged_df['prev_weighted_score'].isna())
-    
-    last_gen_dates_map = _get_all_last_gen_dates()
-    last_gen_df = pd.DataFrame(list(last_gen_dates_map.items()), columns=['ticker', 'last_gen_date'])
-    merged_df = pd.merge(merged_df, last_gen_df, on='ticker', how='left')
-
-    today_date = date.today()
-    merged_df['needs_new_text'] = merged_df['needs_new_text'] | (
-        merged_df['last_gen_date'].apply(lambda x: (today_date - x).days >= 7 if pd.notnull(x) else True)
-    )
-    
-    logging.info(f"Found {len(today_df)} tickers. Flagged {merged_df['needs_new_text'].sum()} for new text generation.")
-    return merged_df.to_dict('records')
-
-
-def _get_latest_recommendation_text_from_gcs(ticker: str) -> str | None:
-    """Retrieves the text from the most recent recommendation file for a ticker."""
-    prefix = f"{config.RECOMMENDATION_PREFIX}{ticker}_recommendation_"
-    blobs = gcs.list_blobs(config.GCS_BUCKET_NAME, prefix)
-    if not blobs: return None
-    latest_blob_name = sorted(blobs, reverse=True)[0]
-    try:
-        content = gcs.read_blob(config.GCS_BUCKET_NAME, latest_blob_name)
-        # Return content without the chart section
-        return content.split("\n\n### 90-Day Performance")[0].strip() if content else None
-    except Exception as e:
-        logging.error(f"[{ticker}] Failed to read latest recommendation {latest_blob_name}: {e}")
-    return None
 
 def _delete_all_recommendations_for_ticker(ticker: str):
-    """Deletes all old recommendation files for a given ticker."""
+    """Deletes all old recommendation files for a given ticker to ensure only the latest exists."""
     prefix = f"{config.RECOMMENDATION_PREFIX}{ticker}_recommendation_"
     blobs_to_delete = gcs.list_blobs(config.GCS_BUCKET_NAME, prefix)
     for blob_name in blobs_to_delete:
@@ -197,32 +173,35 @@ def _delete_all_recommendations_for_ticker(ticker: str):
 
 def _process_ticker(ticker_data: dict):
     """
-    Main worker function for a single ticker.
+    Main worker function for a single ticker using the new logic.
     """
     ticker = ticker_data["ticker"]
-    company_name = ticker_data["company_name"]
-    needs_new_text = ticker_data["needs_new_text"]
     today_str = date.today().strftime('%Y-%m-%d')
     md_blob_path = f"{config.RECOMMENDATION_PREFIX}{ticker}_recommendation_{today_str}.md"
     
     try:
-        recommendation_text = ""
-        if needs_new_text:
-            prompt = _PROMPT_TEMPLATE.format(
-                ticker=ticker,
-                company_name=company_name,
-                weighted_score=ticker_data["weighted_score"],
-                aggregated_text=ticker_data["aggregated_text"],
-                example_output=_EXAMPLE_OUTPUT
-            )
-            recommendation_text = vertex_ai.generate(prompt)
-        else:
-            recommendation_text = _get_latest_recommendation_text_from_gcs(ticker)
+        # Generate the new, richer signals
+        outlook_signal, momentum_context = _get_signal_and_context(
+            ticker_data["weighted_score"],
+            ticker_data.get("close_30d_delta_pct")
+        )
+
+        prompt = _PROMPT_TEMPLATE.format(
+            ticker=ticker,
+            company_name=ticker_data["company_name"],
+            outlook_signal=outlook_signal,
+            momentum_context=momentum_context,
+            aggregated_text=ticker_data["aggregated_text"],
+            example_output=_EXAMPLE_OUTPUT
+        )
+        
+        recommendation_text = vertex_ai.generate(prompt)
 
         if not recommendation_text:
-            logging.error(f"[{ticker}] Could not get or generate text. Aborting.")
+            logging.error(f"[{ticker}] LLM returned no text. Aborting.")
             return None
         
+        # Clean slate: remove old files before writing the new one
         _delete_all_recommendations_for_ticker(ticker)
         gcs.write_text(config.GCS_BUCKET_NAME, md_blob_path, recommendation_text, "text/markdown")
         
@@ -234,11 +213,10 @@ def _process_ticker(ticker_data: dict):
         return None
 
 def run_pipeline():
-    logging.info("--- Starting Optimized Recommendation Generation Pipeline ---")
+    logging.info("--- Starting Advanced Recommendation Generation Pipeline ---")
     
     work_list = _get_daily_work_list()
     if not work_list:
-        logging.warning("No tickers in daily work list. Exiting.")
         return
     
     processed_count = 0

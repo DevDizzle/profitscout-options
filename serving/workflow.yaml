@@ -4,97 +4,79 @@ main:
         assign:
           - project_id: "profitscout-lx6bb"
           - region: "us-central1"
-
+          # Names of all the Cloud Functions to be called in the serving layer
+          - score_aggregator_name: "score-aggregator" # Assuming this is the name of your aggregator function
           - data_cruncher_name: "run-data-cruncher"
           - recommendations_generator_name: "recommendations-generator"
-          - options_analyzer_name: "options-analyzer"
-          - dashboard_generator_name: "run-dashboard-generator"
           - page_generator_name: "page-generator"
+          - dashboard_generator_name: "run-dashboard-generator"
           - data_bundler_name: "data-bundler"
           - sync_to_firestore_name: "sync-to-firestore"
           - sync_options_to_firestore_name: "run-sync-options-to-firestore"
           - sync_calendar_to_firestore_name: "run-sync-calendar-to-firestore"
 
-          # Shared result variables for parallel branches
-          - recs_result: {}
-          - options_analyzer_result: {}
-          - dashboard_result: {}
-          - page_result: {}
-          - sync_main_result: {}
-          - sync_options_result: {}
-          - sync_calendar_result: {}
+    # Step 1: Run the initial data processing jobs in parallel
+    - parallel_initial_processing:
+        parallel:
+          branches:
+            - run_score_aggregator:
+                steps:
+                  - call_score_aggregator:
+                      call: http.post
+                      args:
+                        url: ${"https://" + region + "-" + project_id + ".cloudfunctions.net/" + score_aggregator_name}
+                        auth: { type: OIDC }
+                        timeout: 900
+                      result: score_aggregator_result
+            - run_data_cruncher:
+                steps:
+                  - call_data_cruncher:
+                      call: http.post
+                      args:
+                        url: ${"https://" + region + "-" + project_id + ".cloudfunctions.net/" + data_cruncher_name}
+                        auth: { type: OIDC }
+                        timeout: 900
+                      result: data_cruncher_result
 
-    - call_data_cruncher:
+    # Step 2: Generate the stock-level recommendations (depends on score_aggregator)
+    - call_recommendations_generator:
         call: http.post
         args:
-          url: ${"https://" + region + "-" + project_id + ".cloudfunctions.net/" + data_cruncher_name}
-          auth:
-            type: OIDC
-          timeout: 900
-        result: data_cruncher_result
+          url: ${"https://" + region + "-" + project_id + ".cloudfunctions.net/" + recommendations_generator_name}
+          auth: { type: OIDC }
+          timeout: 1800 # Increased timeout for LLM-heavy task
+        result: recommendations_result
 
-    - parallel_content_generation:
-        parallel:
-          shared: [recs_result, options_analyzer_result]
-          branches:
-            - run_recommendations:
-                steps:
-                  - call_recommendations_generator:
-                      call: http.post
-                      args:
-                        url: ${"https://" + region + "-" + project_id + ".cloudfunctions.net/" + recommendations_generator_name}
-                        auth:
-                          type: OIDC
-                        timeout: 900
-                      result: recs_result
-            - run_options_analyzer:
-                steps:
-                  - call_options_analyzer:
-                      call: http.post
-                      args:
-                        url: ${"https://" + region + "-" + project_id + ".cloudfunctions.net/" + options_analyzer_name}
-                        auth:
-                          type: OIDC
-                        timeout: 900
-                      result: options_analyzer_result
+    # Step 3: Generate the page JSON (depends on recommendations_generator)
+    - call_page_generator:
+        call: http.post
+        args:
+          url: ${"https://" + region + "-" + project_id + ".cloudfunctions.net/" + page_generator_name}
+          auth: { type: OIDC }
+          timeout: 1800 # Increased timeout for LLM-heavy task
+        result: page_result
 
-    - parallel_json_assembly:
-        parallel:
-          shared: [dashboard_result, page_result]
-          branches:
-            - run_dashboard_generator:
-                steps:
-                  - call_dashboard_generator:
-                      call: http.post
-                      args:
-                        url: ${"https://" + region + "-" + project_id + ".cloudfunctions.net/" + dashboard_generator_name}
-                        auth:
-                          type: OIDC
-                        timeout: 900
-                      result: dashboard_result
-            - run_page_generator:
-                steps:
-                  - call_page_generator:
-                      call: http.post
-                      args:
-                        url: ${"https://" + region + "-" + project_id + ".cloudfunctions.net/" + page_generator_name}
-                        auth:
-                          type: OIDC
-                        timeout: 900
-                      result: page_result
+    # Step 4: Generate the final dashboard JSON (depends on data_cruncher and recommendations)
+    - call_dashboard_generator:
+        call: http.post
+        args:
+          url: ${"https://" + region + "-" + project_id + ".cloudfunctions.net/" + dashboard_generator_name}
+          auth: { type: OIDC }
+          timeout: 1800 # Increased timeout for LLM-heavy task
+        result: dashboard_result
 
+    # Step 5: Bundle all generated assets and metadata
     - call_data_bundler:
         call: http.post
         args:
           url: ${"https://" + region + "-" + project_id + ".cloudfunctions.net/" + data_bundler_name}
-          auth:
-            type: OIDC
+          auth: { type: OIDC }
           timeout: 900
         result: data_bundler_result
 
+    # Step 6: Sync all final data to Firestore in parallel
     - final_sync:
         parallel:
-          shared: [sync_main_result, sync_options_result, sync_calendar_result]
           branches:
             - run_sync_main:
                 steps:
@@ -102,8 +84,7 @@ main:
                       call: http.post
                       args:
                         url: ${"https://" + region + "-" + project_id + ".cloudfunctions.net/" + sync_to_firestore_name}
-                        auth:
-                          type: OIDC
+                        auth: { type: OIDC }
                         timeout: 900
                         body:
                           full_reset: false
@@ -114,8 +95,7 @@ main:
                       call: http.post
                       args:
                         url: ${"https://" + region + "-" + project_id + ".cloudfunctions.net/" + sync_options_to_firestore_name}
-                        auth:
-                          type: OIDC
+                        auth: { type: OIDC }
                         timeout: 900
                         body:
                           full_reset: false
@@ -126,8 +106,7 @@ main:
                       call: http.post
                       args:
                         url: ${"https://" + region + "-" + project_id + ".cloudfunctions.net/" + sync_calendar_to_firestore_name}
-                        auth:
-                          type: OIDC
+                        auth: { type: OIDC }
                         timeout: 900
                       result: sync_calendar_result
 
@@ -137,4 +116,4 @@ main:
           text: "Serving layer workflow finished successfully."
 
     - done:
-        return: "Workflow finished successfully." 
+        return: "Workflow finished successfully."
