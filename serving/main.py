@@ -10,9 +10,15 @@ from core.pipelines import (
     dashboard_generator,
     sync_options_to_firestore,
     sync_calendar_to_firestore,
+    recommendations_generator,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+@functions_framework.http
+def run_recommendations_generator(request):
+    recommendations_generator.run_pipeline()
+    return "Recommendations generator pipeline finished.", 200
 
 @functions_framework.http
 def run_sync_calendar_to_firestore(request):

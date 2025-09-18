@@ -11,6 +11,7 @@ from typing import Dict, Any, List, Optional
 from .. import config, gcs
 from ..clients import vertex_ai
 
+# ... (Configuration and LLM prompts remain the same) ...
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s")
 PREP_PREFIX = "prep/"
@@ -20,7 +21,8 @@ RECOMMENDATION_PREFIX = "recommendations/"
 OPTIONS_ANALYSIS_PREFIX = "options-analysis/contracts/"
 MAX_WORKERS = 8
 
-# ... (LLM Prompting section remains the same) ...
+# --- LLM Prompting Updated for New KPIs ---
+
 _EXAMPLE_JSON_FOR_LLM = """
 {
   "seo": {
@@ -76,6 +78,7 @@ Use the `signal` from the `trendStrength` KPI to set the teaser signal. Capitali
 {example_json}
 """
 
+
 def _slug(s: str) -> str:
     """Creates a safe filename string, consistent with the enrichment service."""
     return re.sub(r"[^a-zA-Z0-9._-]+", "-", s)[:200]
@@ -128,10 +131,13 @@ def _get_options_chain_table(ticker: str) -> List[Dict[str, Any]]:
     if df.empty:
         return []
 
-    # Clean data for JSON serialization
-    for col in df.select_dtypes(include=['dbdate', 'dbtimestamp', 'datetimetz']).columns:
-        df[col] = df[col].astype(str)
-    
+    # --- THIS IS THE CORRECTED SECTION ---
+    # Convert special date/timestamp columns to string for JSON serialization
+    for col in df.columns:
+        dtype_str = str(df[col].dtype)
+        if 'dbdate' in dtype_str or 'dbtimestamp' in dtype_str or 'datetimetz' in dtype_str:
+            df[col] = df[col].astype(str)
+
     records = df.to_dict('records')
     
     # Enrich each record with its detailed analysis
@@ -189,10 +195,10 @@ def process_ticker(prep_blob_name: str) -> Optional[str]:
             "titleInfo": {"companyName": company_name, "ticker": ticker, "asOfDate": run_date_str},
             "kpis": prep_data.get("kpis"),
             "priceChartData": price_chart_data,
-            "stockLevelAnalysis": stock_analysis, # For default view
+            "stockLevelAnalysis": stock_analysis,
             "optionsTable": {
                 "title": "Top AI-Curated Options",
-                "chains": enriched_chain_table # Enriched with analysis
+                "chains": enriched_chain_table
             },
             "seo": llm_data.get("seo"),
             "teaser": llm_data.get("teaser"),
