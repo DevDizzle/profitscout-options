@@ -10,6 +10,7 @@ BIGQUERY_DATASET = os.getenv("BIGQUERY_DATASET", "profit_scout")
 SCORES_TABLE = f"{PROJECT_ID}.{BIGQUERY_DATASET}.analysis_scores"
 CHAIN_TABLE  = f"{PROJECT_ID}.{BIGQUERY_DATASET}.options_chain"
 CAND_TABLE   = f"{PROJECT_ID}.{BIGQUERY_DATASET}.options_candidates"
+PRICE_TABLE_ID = f"{PROJECT_ID}.{BIGQUERY_DATASET}.price_data"
 
 # --- Vertex AI (Shared) ---
 MODEL_NAME = os.environ.get("MODEL_NAME", "gemini-2.5-pro")

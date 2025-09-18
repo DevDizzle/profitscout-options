@@ -6,7 +6,7 @@ import re
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from google.cloud import bigquery
-from datetime import date
+from datetime import date, datetime
 from typing import Dict, Optional
 
 from .. import config, gcs
@@ -89,14 +89,13 @@ def _split_aggregated_text(aggregated_text: str) -> Dict[str, str]:
         if match:
             key = match.group(1).lower().replace(' ', '')
             text = match.group(2).strip()
-            # --- THIS IS THE MODIFIED SECTION ---
             key_map = {
                 "news": "newsSummary",
                 "technicals": "technicals",
                 "mda": "mdAndA",
                 "transcript": "earningsCall",
                 "financials": "financials",
-                "fundamentals": "fundamentals" # <-- ADDED
+                "fundamentals": "fundamentals"
             }
             final_key = key_map.get(key, key)
             section_dict[final_key] = text
@@ -212,13 +211,16 @@ def process_blob(blob_name: str) -> Optional[str]:
 
 
 def run_pipeline():
-    """Finds recommendation files that are missing a page and processes them."""
-    logging.info("--- Starting Page Generation Pipeline ---")
+    """
+    --- NEW LOGIC ---
+    Finds the LATEST recommendation file for each ticker and processes it,
+    ensuring old page files are replaced.
+    """
+    logging.info("--- Starting Page Generation Pipeline (with overwrite logic) ---")
 
     all_recommendations = gcs.list_blobs(config.GCS_BUCKET_NAME, prefix=INPUT_PREFIX)
-    all_pages = set(gcs.list_blobs(config.GCS_BUCKET_NAME, prefix=OUTPUT_PREFIX))
-
-    work_items = []
+    
+    latest_recs = {}
     dated_format_regex = re.compile(r'([A-Z\.]+)_recommendation_(\d{4}-\d{2}-\d{2})\.md$')
 
     for rec_path in all_recommendations:
@@ -227,18 +229,20 @@ def run_pipeline():
         if not match: continue
 
         ticker, run_date_str = match.groups()
-        expected_page_path = f"{OUTPUT_PREFIX}{ticker}_page_{run_date_str}.json"
+        
+        # If we haven't seen this ticker, or if this file is newer, update it
+        if ticker not in latest_recs or run_date_str > latest_recs[ticker]['date']:
+            latest_recs[ticker] = {'date': run_date_str, 'path': rec_path}
 
-        if expected_page_path not in all_pages:
-            work_items.append(rec_path)
+    work_items = [v['path'] for v in latest_recs.values()]
 
     if not work_items:
-        logging.info("All recommendations have a corresponding page JSON.")
+        logging.info("No recommendation files found to process.")
         return
 
-    logging.info(f"Found {len(work_items)} new recommendations to process into pages.")
+    logging.info(f"Found {len(work_items)} latest recommendations to process into pages.")
     with ThreadPoolExecutor(max_workers=config.MAX_WORKERS_RECOMMENDER) as executor:
         futures = [executor.submit(process_blob, item) for item in work_items]
         count = sum(1 for future in as_completed(futures) if future.result())
 
-    logging.info(f"--- Page Generation Pipeline Finished. Processed {count} new pages. ---")
+    logging.info(f"--- Page Generation Pipeline Finished. Processed {count} pages. ---")
