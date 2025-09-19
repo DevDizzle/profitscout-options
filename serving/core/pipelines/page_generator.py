@@ -6,7 +6,7 @@ import re
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from google.cloud import bigquery
-from datetime import date, datetime
+from datetime import date
 from typing import Dict, Optional
 
 from .. import config, gcs
@@ -89,13 +89,14 @@ def _split_aggregated_text(aggregated_text: str) -> Dict[str, str]:
         if match:
             key = match.group(1).lower().replace(' ', '')
             text = match.group(2).strip()
+            # --- THIS IS THE MODIFIED SECTION ---
             key_map = {
                 "news": "newsSummary",
                 "technicals": "technicals",
                 "mda": "mdAndA",
                 "transcript": "earningsCall",
                 "financials": "financials",
-                "fundamentals": "fundamentals"
+                "fundamentals": "fundamentals" # <-- ADDED
             }
             final_key = key_map.get(key, key)
             section_dict[final_key] = text
@@ -197,6 +198,7 @@ def process_blob(blob_name: str) -> Optional[str]:
         llm_generated_data = json.loads(llm_response_str)
         final_json.update(llm_generated_data)
 
+        # This is the key: delete old files before writing the new one.
         _delete_old_page_files(ticker)
         gcs.write_text(config.GCS_BUCKET_NAME, json_blob_path, json.dumps(final_json, indent=2), "application/json")
         logging.info(f"[{ticker}] Successfully uploaded complete JSON file to {json_blob_path}")
@@ -212,37 +214,23 @@ def process_blob(blob_name: str) -> Optional[str]:
 
 def run_pipeline():
     """
-    --- NEW LOGIC ---
-    Finds the LATEST recommendation file for each ticker and processes it,
-    ensuring old page files are replaced.
+    Finds all available recommendations and generates a fresh page JSON for each,
+    deleting any old page files in the process.
     """
-    logging.info("--- Starting Page Generation Pipeline (with overwrite logic) ---")
+    logging.info("--- Starting Page Generation Pipeline ---")
 
-    all_recommendations = gcs.list_blobs(config.GCS_BUCKET_NAME, prefix=INPUT_PREFIX)
-    
-    latest_recs = {}
-    dated_format_regex = re.compile(r'([A-Z\.]+)_recommendation_(\d{4}-\d{2}-\d{2})\.md$')
-
-    for rec_path in all_recommendations:
-        file_name = os.path.basename(rec_path)
-        match = dated_format_regex.match(file_name)
-        if not match: continue
-
-        ticker, run_date_str = match.groups()
-        
-        # If we haven't seen this ticker, or if this file is newer, update it
-        if ticker not in latest_recs or run_date_str > latest_recs[ticker]['date']:
-            latest_recs[ticker] = {'date': run_date_str, 'path': rec_path}
-
-    work_items = [v['path'] for v in latest_recs.values()]
+    # --- THIS IS THE FIX ---
+    # We no longer need to check for existing pages. We simply process all
+    # recommendations that are present. The deletion logic is handled inside process_blob.
+    work_items = gcs.list_blobs(config.GCS_BUCKET_NAME, prefix=INPUT_PREFIX)
 
     if not work_items:
         logging.info("No recommendation files found to process.")
         return
 
-    logging.info(f"Found {len(work_items)} latest recommendations to process into pages.")
+    logging.info(f"Found {len(work_items)} recommendations to process into pages.")
     with ThreadPoolExecutor(max_workers=config.MAX_WORKERS_RECOMMENDER) as executor:
         futures = [executor.submit(process_blob, item) for item in work_items]
         count = sum(1 for future in as_completed(futures) if future.result())
 
-    logging.info(f"--- Page Generation Pipeline Finished. Processed {count} pages. ---")
+    logging.info(f"--- Page Generation Pipeline Finished. Processed {count} new pages. ---")

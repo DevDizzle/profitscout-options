@@ -2,7 +2,7 @@
 import logging
 import pandas as pd
 from datetime import date
-from typing import Optional # <-- ADD THIS LINE
+from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from google.cloud import bigquery, storage
 from .. import config
@@ -55,42 +55,53 @@ def _fetch_all_data(tickers: list[str], bq_client: bigquery.Client) -> tuple[pd.
 
 def _process_ticker(ticker: str, snapshot_date: date, chain_df: pd.DataFrame, price_history_df: pd.DataFrame) -> Optional[dict]:
     """
-    Worker function to process data for one ticker IN MEMORY.
+    Worker function to process data for one ticker.
+    If no options chain data exists, it imputes options-specific fields and proceeds with price-based calculations.
     """
     try:
-        if chain_df.empty:
-            logging.warning(f"No options chain data found for {ticker} for today. Skipping feature engineering.")
+        if price_history_df.empty:
+            logging.warning(f"[{ticker}] No price history data found. Cannot generate any features.")
             return None
+
+        iv_avg = None
+        iv_signal = None
+        
+        if chain_df.empty:
+            logging.warning(f"[{ticker}] No options chain data found for today. Imputing options-specific values as NULL.")
+        else:
+            uprice = None
+            if "underlying_price" in chain_df.columns:
+                u = pd.to_numeric(chain_df["underlying_price"], errors="coerce").dropna()
+                if not u.empty: uprice = float(u.iloc[0])
+
+            if uprice is None:
+                uprice = price_history_df['close'].iloc[-1]
+
+            iv_avg = helper.compute_iv_avg_atm(chain_df, uprice, snapshot_date) if uprice else None
             
-        uprice = None
-        if "underlying_price" in chain_df.columns:
-            u = pd.to_numeric(chain_df["underlying_price"], errors="coerce").dropna()
-            if not u.empty: uprice = float(u.iloc[0])
-
-        if uprice is None and not price_history_df.empty:
-            uprice = price_history_df['close'].iloc[-1]
-
-        iv_avg = helper.compute_iv_avg_atm(chain_df, uprice, snapshot_date) if uprice else None
+            hv_30_for_signal = helper.compute_hv30(None, ticker, snapshot_date, price_history_df=price_history_df)
+            if iv_avg is not None and hv_30_for_signal is not None:
+                try: 
+                    iv_signal = "high" if iv_avg > (hv_30_for_signal + 0.10) else "low"
+                except Exception: 
+                    pass
         
         hv_30 = helper.compute_hv30(None, ticker, snapshot_date, price_history_df=price_history_df)
         tech = helper.compute_technicals_and_deltas(price_history_df)
-        
-        iv_signal = None
-        if iv_avg is not None and hv_30 is not None:
-            try: iv_signal = "high" if iv_avg > (hv_30 + 0.10) else "low"
-            except Exception: pass
         
         latest_price_row = price_history_df.sort_values('date').iloc[-1]
         
         final_row = {
             "ticker": ticker, "date": snapshot_date,
-            "open": latest_price_row.get('open'),
-            "high": latest_price_row.get('high'),
-            "low": latest_price_row.get('low'),
-            "adj_close": latest_price_row.get('close'),
-            "volume": latest_price_row.get('volume'),
-            "iv_avg": iv_avg, "hv_30": hv_30,
-            "iv_signal": iv_signal, **tech
+            "open": float(latest_price_row['open']) if pd.notna(latest_price_row['open']) else None,
+            "high": float(latest_price_row['high']) if pd.notna(latest_price_row['high']) else None,
+            "low": float(latest_price_row['low']) if pd.notna(latest_price_row['low']) else None,
+            "adj_close": float(latest_price_row['close']) if pd.notna(latest_price_row['close']) else None,
+            "volume": int(latest_price_row['volume']) if pd.notna(latest_price_row['volume']) else None,
+            "iv_avg": iv_avg,
+            "hv_30": hv_30,
+            "iv_signal": iv_signal,
+            **tech
         }
         return final_row
         
@@ -139,6 +150,8 @@ def run_pipeline():
     logging.info(f"Bulk upserting {len(results)} records to BigQuery...")
     helper.upsert_analysis_rows(bq_client, results, enrich_ohlcv=False)
     
+    # --- THIS IS THE FIX ---
+    # Un-commented the call to the new helper function.
     logging.info("--- Backfilling IV Industry Average for consistency (if needed) ---")
     helper.backfill_iv_industry_avg_for_date(bq=bq_client, run_date=snapshot_date)
     

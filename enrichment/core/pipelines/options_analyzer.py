@@ -142,9 +142,8 @@ def _process_contract(row: pd.Series):
         if quality not in ("Strong", "Fair", "Weak"):
             raise ValueError(f"Invalid 'setup_quality' received: {quality}")
 
-        # Map quality to symbols
-        quality_map = {"Strong": "🟢", "Fair": "🟡", "Weak": "🔴"}
-
+        # --- THIS IS THE FIX ---
+        # We now directly use the text ("Strong", "Fair", "Weak") instead of mapping to emojis.
         return {
             "ticker": ticker,
             "run_date": row.get("fetch_date"),
@@ -152,7 +151,7 @@ def _process_contract(row: pd.Series):
             "strike_price": row.get("strike"),
             "implied_volatility": row.get("implied_volatility"),
             "iv_signal": row.get("iv_signal"),
-            "setup_quality_signal": quality_map.get(quality, "🔴"),
+            "setup_quality_signal": quality, # Use the direct text value
             "summary": obj.get("summary"),
             "contract_symbol": csym,
             "option_type": str(row["option_type"]).lower()

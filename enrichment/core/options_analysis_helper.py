@@ -17,8 +17,8 @@ PROJECT = "profitscout-lx6bb"
 DATASET = "profit_scout"
 PRICE_TABLE_ID = f"{PROJECT}.{DATASET}.price_data"
 TARGET_TABLE_ID = f"{PROJECT}.{DATASET}.options_analysis_input"
-# NEW: permanent staging table (reused every run)
 STAGING_TABLE_ID = f"{PROJECT}.{DATASET}._stg_options_analysis"
+METADATA_TABLE_ID = f"{PROJECT}.{DATASET}.stock_metadata" # Added for industry lookup
 
 RSI_LEN, SMA50, SMA200 = 14, 50, 200
 ATM_DTE_MIN, ATM_DTE_MAX, ATM_MNY_PCT = 7, 90, 0.05
@@ -158,18 +158,13 @@ def upsert_analysis_rows(bq: bigquery.Client, rows: List[Dict], enrich_ohlcv: bo
             if k in ohlcv:
                 r.update(ohlcv[k])
 
-    # Columns present in this batch (plus keys)
     present_cols = sorted({k for r in norm for k, v in r.items() if v is not None} | {"ticker", "date"})
 
-    # Overwrite staging table atomically for this run
     load_cfg = bigquery.LoadJobConfig(write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE)
     bq.load_table_from_json(norm, STAGING_TABLE_ID, job_config=load_cfg).result()
 
-    # Single MERGE from staging into target
     _merge_from_staging(bq, present_cols)
 
-
-# ------------------- Compute helpers (unchanged) -------------------
 
 def compute_iv_avg_atm(
     full_chain_df: pd.DataFrame, underlying_price: Optional[float], as_of: dt.date
@@ -214,16 +209,9 @@ def _fetch_history_for_technicals(bq: bigquery.Client, ticker: str, as_of: dt.da
 
 def compute_technicals_and_deltas(price_hist: pd.DataFrame) -> Dict[str, Optional[float]]:
     out_keys = [
-        "latest_rsi",
-        "latest_macd",
-        "latest_sma50",
-        "latest_sma200",
-        "close_30d_delta_pct",
-        "rsi_30d_delta",
-        "macd_30d_delta",
-        "close_90d_delta_pct",
-        "rsi_90d_delta",
-        "macd_90d_delta",
+        "latest_rsi", "latest_macd", "latest_sma50", "latest_sma200",
+        "close_30d_delta_pct", "rsi_30d_delta", "macd_30d_delta",
+        "close_90d_delta_pct", "rsi_90d_delta", "macd_90d_delta",
     ]
     if price_hist is None or price_hist.empty:
         return {k: None for k in out_keys}
@@ -248,22 +236,14 @@ def compute_technicals_and_deltas(price_hist: pd.DataFrame) -> Dict[str, Optiona
     try:
         if len(valid) >= 31:
             ago_30 = valid.iloc[-31]
-            out["close_30d_delta_pct"] = _safe_float(
-                (latest["close"] - ago_30["close"]) / ago_30["close"] * 100.0
-            )
+            out["close_30d_delta_pct"] = _safe_float((latest["close"] - ago_30["close"]) / ago_30["close"] * 100.0)
             out["rsi_30d_delta"] = _safe_float(latest["RSI_14"] - ago_30["RSI_14"])
-            out["macd_30d_delta"] = _safe_float(
-                latest["MACD_12_26_9"] - ago_30["MACD_12_26_9"]
-            )
-        if len(valid) >= 91:
-            ago_90 = valid.iloc[-91]
-            out["close_90d_delta_pct"] = _safe_float(
-                (latest["close"] - ago_90["close"]) / ago_90["close"] * 100.0
-            )
+            out["macd_30d_delta"] = _safe_float(latest["MACD_12_26_9"] - ago_30["MACD_12_26_9"])
+        if len(valid) >= 90:
+            ago_90 = valid.iloc[-90]
+            out["close_90d_delta_pct"] = _safe_float((latest["close"] - ago_90["close"]) / ago_90["close"] * 100.0)
             out["rsi_90d_delta"] = _safe_float(latest["RSI_14"] - ago_90["RSI_14"])
-            out["macd_90d_delta"] = _safe_float(
-                latest["MACD_12_26_9"] - ago_90["MACD_12_26_9"]
-            )
+            out["macd_90d_delta"] = _safe_float(latest["MACD_12_26_9"] - ago_90["MACD_12_26_9"])
     except Exception:
         pass
     return out
@@ -275,7 +255,7 @@ def compute_hv30(
     df_to_use = price_history_df
     if df_to_use is None:
         q = f"""
-            SELECT date, adj_close
+            SELECT date, adj_close AS close
             FROM `{PRICE_TABLE_ID}`
             WHERE ticker = @ticker AND date > DATE_SUB(@as_of, INTERVAL 45 DAY) AND date <= @as_of
             ORDER BY date
@@ -289,6 +269,65 @@ def compute_hv30(
     if df_to_use.empty or len(df_to_use) < 2:
         return None
 
-    df_to_use["log_return"] = np.log(df_to_use["adj_close"] / df_to_use["adj_close"].shift(1))
+    df_to_use["log_return"] = np.log(df_to_use["close"] / df_to_use["close"].shift(1))
     std_dev = df_to_use["log_return"].std()
-    return _safe_flo
+    
+    return _safe_float(std_dev * np.sqrt(252))
+
+
+def backfill_iv_industry_avg_for_date(bq: bigquery.Client, run_date: dt.date) -> None:
+    """
+    Calculates the industry average IV for a given date and backfills it
+    into the options_analysis_input table.
+    """
+    print(f"Starting backfill for IV industry average for date: {run_date}")
+    
+    sql = f"""
+    MERGE `{TARGET_TABLE_ID}` T
+    USING (
+        WITH IndustryAverages AS (
+            SELECT
+                m.industry,
+                a.date,
+                AVG(a.iv_avg) AS calculated_industry_avg
+            FROM `{TARGET_TABLE_ID}` a
+            JOIN (
+                SELECT ticker, industry, ROW_NUMBER() OVER(PARTITION BY ticker ORDER BY quarter_end_date DESC) as rn
+                FROM `{METADATA_TABLE_ID}`
+            ) m ON a.ticker = m.ticker AND m.rn = 1
+            WHERE a.date = @run_date
+              AND a.iv_avg IS NOT NULL
+              AND m.industry IS NOT NULL
+            GROUP BY m.industry, a.date
+        )
+        SELECT
+            t.ticker,
+            t.date,
+            ia.calculated_industry_avg
+        FROM `{TARGET_TABLE_ID}` t
+        JOIN (
+            SELECT ticker, industry, ROW_NUMBER() OVER(PARTITION BY ticker ORDER BY quarter_end_date DESC) as rn
+            FROM `{METADATA_TABLE_ID}`
+        ) m ON t.ticker = m.ticker AND m.rn = 1
+        JOIN IndustryAverages ia ON m.industry = ia.industry AND t.date = ia.date
+        WHERE t.date = @run_date AND t.iv_industry_avg IS NULL
+    ) S
+    ON T.ticker = S.ticker AND T.date = S.date
+    WHEN MATCHED THEN
+        UPDATE SET T.iv_industry_avg = S.calculated_industry_avg
+    """
+    
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("run_date", "DATE", run_date),
+        ]
+    )
+    
+    try:
+        query_job = bq.query(sql, job_config=job_config)
+        query_job.result()
+        print(f"Successfully backfilled IV industry averages for {run_date}. "
+              f"{query_job.num_dml_affected_rows} rows were updated.")
+    except Exception as e:
+        print(f"An error occurred during IV industry average backfill: {e}")
+        raise

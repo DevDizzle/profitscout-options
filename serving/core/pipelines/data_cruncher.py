@@ -50,17 +50,35 @@ def _fetch_and_calculate_kpis(ticker: str) -> Optional[str]:
 
     try:
         enriched_query = f"""
-            SELECT *
-            FROM `{config.SOURCE_PROJECT_ID}.{config.BIGQUERY_DATASET}.options_analysis_input`
-            WHERE ticker = @ticker
-            ORDER BY date DESC
-            LIMIT 1
+            WITH latest_analysis AS (
+                SELECT *
+                FROM `{config.SOURCE_PROJECT_ID}.{config.BIGQUERY_DATASET}.options_analysis_input`
+                WHERE ticker = @ticker
+                ORDER BY date DESC
+                LIMIT 1
+            ),
+            avg_volume AS (
+                SELECT
+                    ticker,
+                    AVG(volume) as avg_volume_30d
+                FROM `{config.PRICE_DATA_TABLE_ID}`
+                WHERE ticker = @ticker
+                  AND date >= DATE_SUB((SELECT date FROM latest_analysis), INTERVAL 30 DAY)
+                  AND date <= (SELECT date FROM latest_analysis)
+                GROUP BY ticker
+            )
+            SELECT
+                a.*,
+                v.avg_volume_30d
+            FROM latest_analysis a
+            LEFT JOIN avg_volume v ON a.ticker = v.ticker
         """
         job_config = bigquery.QueryJobConfig(query_parameters=[bigquery.ScalarQueryParameter("ticker", "STRING", ticker)])
         enriched_df = client.query(enriched_query, job_config=job_config).to_dataframe()
 
         if enriched_df.empty:
             logging.warning(f"[{ticker}] No enriched analysis data found.")
+            _delete_old_prep_files(ticker) # Clean up if no data
             return None
 
         latest_row = enriched_df.iloc[0]
@@ -94,8 +112,14 @@ def _fetch_and_calculate_kpis(ticker: str) -> Optional[str]:
         if pd.notna(volume) and pd.notna(avg_volume) and avg_volume > 0:
             surge_pct = (volume / avg_volume - 1) * 100
             signal = "high" if surge_pct > 50 else "normal"
+            
+            # --- THIS IS THE FIX ---
+            # Correctly format the percentage string with a conditional plus sign.
+            rounded_surge = round(surge_pct)
+            value_str = f"+{rounded_surge}%" if rounded_surge > 0 else f"{rounded_surge}%"
+
             final_json["kpis"]["volumeSurge"] = {
-                "value": f"+{round(surge_pct)}%",
+                "value": value_str,
                 "signal": signal,
                 "tooltip": "Today's volume versus its 30-day average."
             }

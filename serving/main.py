@@ -11,9 +11,25 @@ from core.pipelines import (
     sync_options_to_firestore,
     sync_calendar_to_firestore,
     recommendations_generator,
+    winners_dashboard_generator,
+    performance_tracker_updater, # Add this import
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# --- ADD THIS NEW FUNCTION ---
+@functions_framework.http
+def run_performance_tracker_updater(request):
+    """Runs the daily snapshot process for the performance tracker."""
+    performance_tracker_updater.run_pipeline()
+    return "Performance tracker update pipeline finished.", 200
+# -----------------------------
+
+@functions_framework.http
+def run_winners_dashboard_generator(request):
+    """Generates the main 'winners' dashboard table."""
+    winners_dashboard_generator.run_pipeline()
+    return "Winners dashboard generator pipeline finished.", 200
 
 @functions_framework.http
 def run_recommendations_generator(request):
@@ -25,7 +41,6 @@ def run_sync_calendar_to_firestore(request):
     """
     Syncs upcoming calendar events from BigQuery to Firestore.
     """
-    # This pipeline does a full reset by default, so no parameter is needed.
     sync_calendar_to_firestore.run_pipeline()
     return "Sync calendar events to Firestore pipeline finished.", 200
 
@@ -38,6 +53,12 @@ def run_sync_options_to_firestore(request):
             full_reset = True
     sync_options_to_firestore.run_pipeline(full_reset=full_reset)
     return f"Sync options to Firestore pipeline finished. Full reset: {full_reset}", 200
+
+@functions_framework.http
+def run_sync_winners_to_firestore(request):
+    """Syncs the winners dashboard data to Firestore."""
+    sync_winners_to_firestore.run_pipeline()
+    return "Sync winners to Firestore pipeline finished.", 200
 
 @functions_framework.http
 def run_dashboard_generator(request):
