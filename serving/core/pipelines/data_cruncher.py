@@ -42,7 +42,7 @@ def _delete_old_prep_files(ticker: str):
 
 def _fetch_and_calculate_kpis(ticker: str) -> Optional[str]:
     """
-    Fetches enriched data for a single ticker and calculates the 4 main KPIs.
+    Fetches enriched data for a single ticker and calculates the main KPIs.
     """
     client = bigquery.Client(project=config.SOURCE_PROJECT_ID)
     run_date_str = date.today().strftime('%Y-%m-%d')
@@ -78,7 +78,7 @@ def _fetch_and_calculate_kpis(ticker: str) -> Optional[str]:
 
         if enriched_df.empty:
             logging.warning(f"[{ticker}] No enriched analysis data found.")
-            _delete_old_prep_files(ticker) # Clean up if no data
+            _delete_old_prep_files(ticker)
             return None
 
         latest_row = enriched_df.iloc[0]
@@ -86,14 +86,17 @@ def _fetch_and_calculate_kpis(ticker: str) -> Optional[str]:
         # --- KPI 1: Trend Strength ---
         price = latest_row.get('adj_close')
         sma50 = latest_row.get('latest_sma50')
+        price_date = latest_row.get('date')
+
         if pd.notna(price) and pd.notna(sma50):
             signal = "bullish" if price > sma50 else "bearish"
             final_json["kpis"]["trendStrength"] = {
                 "value": "Above 50D MA" if signal == "bullish" else "Below 50D MA",
                 "price": round(price, 2),
+                "price_date": str(price_date.date()) if hasattr(price_date, 'date') else str(price_date),
                 "sma50": round(sma50, 2),
                 "signal": signal,
-                "tooltip": "Compares current price to the 50-day moving average to identify the current trend."
+                "tooltip": "Compares the previous day's closing price to the 50-day moving average to identify the current trend."
             }
 
         # --- KPI 2: RSI (Relative Strength Index) ---
@@ -111,32 +114,35 @@ def _fetch_and_calculate_kpis(ticker: str) -> Optional[str]:
         avg_volume = latest_row.get('avg_volume_30d')
         if pd.notna(volume) and pd.notna(avg_volume) and avg_volume > 0:
             surge_pct = (volume / avg_volume - 1) * 100
-            signal = "high" if surge_pct > 50 else "normal"
-            
-            # --- THIS IS THE FIX ---
-            # Correctly format the percentage string with a conditional plus sign.
-            rounded_surge = round(surge_pct)
-            value_str = f"+{rounded_surge}%" if rounded_surge > 0 else f"{rounded_surge}%"
-
             final_json["kpis"]["volumeSurge"] = {
-                "value": value_str,
-                "signal": signal,
+                "value": round(surge_pct, 2),
+                "signal": "high" if surge_pct > 50 else "normal",
                 "tooltip": "Today's volume versus its 30-day average."
             }
 
+        # --- THIS IS THE FIX ---
         # --- KPI 4: 30-Day Historical Volatility (HV) ---
         hv_30 = latest_row.get('hv_30')
         if pd.notna(hv_30):
             final_json["kpis"]["historicalVolatility"] = {
-                "value": f"{round(hv_30 * 100, 1)}%",
+                "value": round(hv_30 * 100, 2), # Convert to percentage number
                 "signal": "high" if hv_30 > 0.5 else "low" if hv_30 < 0.2 else "moderate",
                 "tooltip": "The stock's actual (realized) volatility over the last 30 days."
+            }
+        
+        # --- KPI 5: 30-Day Price Change ---
+        change_pct = latest_row.get('close_30d_delta_pct')
+        if pd.notna(change_pct):
+            final_json["kpis"]["thirtyDayChange"] = {
+                "value": round(change_pct, 2),
+                "signal": "positive" if change_pct > 0 else "negative",
+                "tooltip": "The stock's price change over the last 30 days."
             }
 
         _delete_old_prep_files(ticker)
         output_blob_name = f"{OUTPUT_PREFIX}{ticker}_{run_date_str}.json"
         gcs.write_text(config.GCS_BUCKET_NAME, output_blob_name, json.dumps(final_json, indent=2))
-        logging.info(f"[{ticker}] Successfully generated and uploaded prep JSON with 4 KPIs.")
+        logging.info(f"[{ticker}] Successfully generated and uploaded prep JSON with 5 KPIs.")
         return output_blob_name
 
     except Exception as e:

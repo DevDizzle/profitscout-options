@@ -81,16 +81,6 @@ def _load_bq_df(bq: bigquery.Client, query: str) -> pd.DataFrame:
 def run_pipeline(full_reset: bool = False):
     """
     Syncs the rolling 90-day forward calendar from BigQuery to Firestore.
-
-    BigQuery minimal schema expected:
-      event_id (STRING, PK)
-      entity (STRING, nullable)
-      event_type (STRING)
-      event_name (STRING)
-      event_date (DATE)
-      event_time (TIMESTAMP, nullable)
-      source (STRING)
-      last_seen (TIMESTAMP)
     """
     db = firestore.Client(project=config.DESTINATION_PROJECT_ID)
     bq = bigquery.Client(project=config.SOURCE_PROJECT_ID)
@@ -112,8 +102,6 @@ def run_pipeline(full_reset: bool = False):
         logging.critical(f"Failed to query calendar events from BigQuery: {e}", exc_info=True)
         raise
 
-    # For simplicity and to avoid stale docs, wipe each run (rolling 90-day window).
-    # If you later move to incremental syncs, you can remove this wipe—doc IDs are stable.
     _delete_collection_in_batches(db, collection_ref)
 
     if calendar_df.empty:
@@ -121,9 +109,8 @@ def run_pipeline(full_reset: bool = False):
         logging.info("--- Calendar Events Firestore Sync Pipeline Finished ---")
         return
 
-    # Compute collection_id:
-    # - Prefer 'entity' (ticker); for economic events where entity is NULL, use event_type ("Economic").
-    # - Sanitize to be a safe Firestore document ID.
+    # --- THIS IS THE CORRECT LOGIC ---
+    # It correctly uses the "entity" column for the ticker and falls back to "event_type" for non-stock events.
     collection_ids = []
     for _, row in calendar_df.iterrows():
         raw_id = row.get("entity") or row.get("event_type") or "UNKNOWN"
@@ -132,31 +119,26 @@ def run_pipeline(full_reset: bool = False):
 
     # Prepare batched upserts
     upsert_ops = []
-    # Group by collection (e.g., AAPL or Economic)
     for collection_id, group in calendar_df.groupby("collection_id"):
         parent_doc_ref = collection_ref.document(collection_id)
         events_collection_ref = parent_doc_ref.collection("events")
 
         for _, row in group.iterrows():
-            # Use stable event_id as the subdocument ID so reruns overwrite cleanly
             event_doc_id = _sanitize_id(str(row["event_id"]), fallback=None)
             if not event_doc_id:
-                # Shouldn't happen, but skip if event_id missing/unusable
                 continue
 
             doc_ref = events_collection_ref.document(event_doc_id)
 
-            # Convert the row to a serializable dict
             event_data = {
                 "event_id": row.get("event_id"),
                 "entity": row.get("entity"),
                 "event_type": row.get("event_type"),
                 "event_name": row.get("event_name"),
-                "event_date": row.get("event_date"),   # already string from _load_bq_df
-                "event_time": row.get("event_time"),   # string or None
+                "event_date": row.get("event_date"),
+                "event_time": row.get("event_time"),
                 "source": row.get("source"),
                 "last_seen": row.get("last_seen"),
-                # Helpful for the app:
                 "collection_id": collection_id,
             }
 

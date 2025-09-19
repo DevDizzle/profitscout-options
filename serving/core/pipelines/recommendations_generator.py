@@ -7,6 +7,7 @@ from .. import config, gcs
 from ..clients import vertex_ai
 from datetime import date, datetime
 import re
+import json # <-- THIS IS THE FIX
 
 # --- Updated: New Example reflecting the richer analysis ---
 _EXAMPLE_OUTPUT = """

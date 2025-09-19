@@ -40,9 +40,8 @@ def _sync_gcs_data():
     source_bucket = storage_client.bucket(config.GCS_BUCKET_NAME, user_project=config.SOURCE_PROJECT_ID)
     destination_bucket = storage_client.bucket(config.DESTINATION_GCS_BUCKET_NAME, user_project=config.DESTINATION_PROJECT_ID)
     
-    # --- THIS IS THE MODIFIED SECTION ---
     prefixes_to_sync = [
-        "price-chart-json/", # <-- ADDED
+        "price-chart-json/",
         "sec-business/", "headline-news/", "sec-mda/",
         "financial-statements/", "earnings-call-transcripts/",
         "recommendations/", "pages/", "dashboards/", "images/",
@@ -73,7 +72,6 @@ def _sync_gcs_data():
     logging.info(f"GCS data sync finished. Copied or overwrote {copied_count} files.")
 
 
-# ... (The rest of the file remains the same) ...
 def _get_latest_daily_files_map() -> Dict[str, Dict[str, str]]:
     """Lists daily files from GCS once and creates a map of the latest file URI for each ticker."""
     storage_client = storage.Client()
@@ -114,11 +112,11 @@ def _get_latest_kpis() -> Dict[str, Dict[str, Any]]:
             ticker = data.get("ticker")
             if not ticker: continue
             
-            # Use this data if it's the first time we see this ticker or if it's a more recent runDate
             if ticker not in latest_kpis or data.get("runDate") > latest_kpis[ticker].get("runDate"):
+                kpis = data.get("kpis", {})
                 latest_kpis[ticker] = {
-                    "price": data.get("kpis", {}).get("price", {}).get("value"),
-                    "thirty_day_change_pct": data.get("kpis", {}).get("thirtyDayChange", {}).get("value"),
+                    "price": kpis.get("trendStrength", {}).get("price"),
+                    "thirty_day_change_pct": kpis.get("thirtyDayChange", {}).get("value"),
                     "runDate": data.get("runDate")
                 }
         except (json.JSONDecodeError, KeyError) as e:
@@ -163,13 +161,11 @@ def _assemble_final_metadata(work_list_df: pd.DataFrame, scores_df: pd.DataFrame
         quarterly_date_str = row["quarter_end_date"].strftime('%Y-%m-%d')
         record = row.to_dict()
 
-        # Add daily URIs
         record["news"] = daily_files_map.get(ticker, {}).get("news")
         record["recommendation_analysis"] = daily_files_map.get(ticker, {}).get("recommendation_analysis")
         record["pages_json"] = daily_files_map.get(ticker, {}).get("pages_json")
         record["dashboard_json"] = daily_files_map.get(ticker, {}).get("dashboard_json")
         
-        # Add quarterly URIs
         record["technicals"] = f"gs://{config.DESTINATION_GCS_BUCKET_NAME}/technicals/{ticker}_technicals.json"
         record["profile"] = f"gs://{config.DESTINATION_GCS_BUCKET_NAME}/sec-business/{ticker}_{quarterly_date_str}.json"
         record["mda"] = f"gs://{config.DESTINATION_GCS_BUCKET_NAME}/sec-mda/{ticker}_{quarterly_date_str}.json"
@@ -177,19 +173,32 @@ def _assemble_final_metadata(work_list_df: pd.DataFrame, scores_df: pd.DataFrame
         record["earnings_transcript"] = f"gs://{config.DESTINATION_GCS_BUCKET_NAME}/earnings-call-transcripts/{ticker}_{quarterly_date_str}.json"
         record["fundamentals"] = f"gs://{config.DESTINATION_GCS_BUCKET_NAME}/fundamentals-analysis/{ticker}_{quarterly_date_str}.json"
         
-        # Add Image URI
         record["image_uri"] = f"gs://{config.DESTINATION_GCS_BUCKET_NAME}/images/{ticker}.png"
 
-        # Add latest KPIs
+        # --- THIS IS THE FIX ---
+        # The logic is now simpler because we expect clean floats from the KPI file.
         ticker_kpis = kpis_map.get(ticker, {})
-        record["price"] = ticker_kpis.get("price")
-        record["thirty_day_change_pct"] = ticker_kpis.get("thirty_day_change_pct")
+        
+        try:
+            record["price"] = float(ticker_kpis.get("price")) if ticker_kpis.get("price") is not None else None
+            record["thirty_day_change_pct"] = float(ticker_kpis.get("thirty_day_change_pct")) if ticker_kpis.get("thirty_day_change_pct") is not None else None
+            record["weighted_score"] = float(row.get("weighted_score")) if row.get("weighted_score") is not None else None
+        except (ValueError, TypeError):
+            # Fallback in case of unexpected non-numeric data
+            record["price"] = record.get("price")
+            record["thirty_day_change_pct"] = record.get("thirty_day_change_pct")
+            record["weighted_score"] = record.get("weighted_score")
 
-        # Determine recommendation
-        weighted_score = row["weighted_score"]
-        if weighted_score > 0.62: record["recommendation"] = "BUY"
-        elif weighted_score >= 0.43: record["recommendation"] = "HOLD"
-        else: record["recommendation"] = "SELL"
+        weighted_score = record["weighted_score"]
+        if weighted_score is not None:
+            if weighted_score > 0.62:
+                record["recommendation"] = "BUY"
+            elif weighted_score >= 0.43:
+                record["recommendation"] = "HOLD"
+            else:
+                record["recommendation"] = "SELL"
+        else:
+            record["recommendation"] = None
         
         final_records.append(record)
     return final_records
@@ -218,4 +227,4 @@ def run_pipeline():
     
     bq.upsert_df_to_bq(df, config.BUNDLER_ASSET_METADATA_TABLE_ID, config.DESTINATION_PROJECT_ID)
     
-    logging.info("--- Data Bundler (Final Assembly) Pipeline Finished ---")
+    logging.info(f"--- Data Bundler (Final Assembly) Pipeline Finished ---")

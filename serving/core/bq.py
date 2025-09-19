@@ -7,19 +7,21 @@ import time
 def load_df_to_bq(df: pd.DataFrame, table_id: str, project_id: str, write_disposition: str = "WRITE_TRUNCATE"):
     """
     Loads a pandas DataFrame into a BigQuery table using simple APPEND or TRUNCATE.
-    This is used by the score_aggregator.
     """
     if df.empty:
         logging.warning("DataFrame is empty. Skipping BigQuery load.")
         return
     
     client = bigquery.Client(project=project_id)
+    
+    # Conditionally add schema_update_options ONLY for WRITE_APPEND
     job_config = bigquery.LoadJobConfig(
         write_disposition=write_disposition,
-        schema_update_options=[
-            bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION
-        ],
     )
+    if write_disposition == "WRITE_APPEND":
+        job_config.schema_update_options = [
+            bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION
+        ]
     
     try:
         job = client.load_table_from_dataframe(df, table_id, job_config=job_config)
@@ -32,8 +34,6 @@ def load_df_to_bq(df: pd.DataFrame, table_id: str, project_id: str, write_dispos
 def upsert_df_to_bq(df: pd.DataFrame, table_id: str, project_id: str):
     """
     Upserts a DataFrame into a BigQuery table using a MERGE statement.
-    The MERGE is based on the 'ticker' column.
-    This is specifically for the data_bundler.
     """
     if df.empty:
         logging.warning("DataFrame is empty. Skipping BigQuery MERGE operation.")
@@ -47,7 +47,6 @@ def upsert_df_to_bq(df: pd.DataFrame, table_id: str, project_id: str):
     temp_table_name = f"{final_table_name}_temp_{int(time.time())}"
     temp_table_id = f"{project_id}.{dataset_id}.{temp_table_name}"
 
-    # Load data into a temporary table
     job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
     try:
         load_job = client.load_table_from_dataframe(df, temp_table_id, job_config=job_config)
@@ -56,7 +55,6 @@ def upsert_df_to_bq(df: pd.DataFrame, table_id: str, project_id: str):
         logging.error(f"Failed to load DataFrame to temp table {temp_table_id}: {e}", exc_info=True)
         raise
 
-    # Dynamically build the MERGE statement
     cols_to_insert = ", ".join([f"`{col}`" for col in df.columns])
     cols_to_update = ", ".join([f"T.`{col}` = S.`{col}`" for col in df.columns if col != 'ticker'])
     

@@ -10,9 +10,10 @@ from core.pipelines import (
     dashboard_generator,
     sync_options_to_firestore,
     sync_calendar_to_firestore,
+    sync_winners_to_firestore,
     recommendations_generator,
     winners_dashboard_generator,
-    performance_tracker_updater, # Add this import
+    performance_tracker_updater,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
