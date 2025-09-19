@@ -76,7 +76,9 @@ def run_pipeline():
     collection_ref = db.collection(FIRESTORE_COLLECTION_NAME)
     logging.info("--- Winners Dashboard Firestore Sync Pipeline ---")
     logging.info(f"Source BQ Table: {WINNERS_TABLE_ID}")
-    logging.info(f"Destination Firestore Collection: {collection_ref.path}")
+    # --- FIXED LINE ---
+    # The correct attribute to get the collection's name is .id, not .path
+    logging.info(f"Destination Firestore Collection: {collection_ref.id}")
 
     # For a daily dashboard, wiping each time is the cleanest approach.
     _delete_collection_in_batches(collection_ref)
