@@ -51,7 +51,7 @@ OPTIONS_MD_PREFIX = os.environ.get("OPTIONS_MD_PREFIX", "options-recommendations
 PAGE_JSON_PREFIX = "pages/"
 
 # --- Data Bundler Pipeline ---
-MAX_WORKERS_BUNDLER = 24
+MAX_WORKERS_BUNDLER = 48
 BQ_DATASET_BUNDLER = "profit_scout"
 ASSET_METADATA_TABLE = "asset_metadata"
 STOCK_METADATA_TABLE = "stock_metadata"

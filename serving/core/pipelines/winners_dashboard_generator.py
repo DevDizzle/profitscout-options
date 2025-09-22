@@ -90,7 +90,8 @@ def _get_asset_metadata(tickers: list) -> pd.DataFrame:
             image_uri,
             price AS last_close,
             thirty_day_change_pct,
-            industry
+            industry,
+            weighted_score
         FROM `{ASSET_METADATA_TABLE_ID}`
         WHERE ticker IN UNNEST(@tickers)
     """
@@ -146,7 +147,7 @@ def run_pipeline():
 
     final_columns = [
         "image_uri", "company_name", "ticker", "outlook_signal",
-        "last_close", "thirty_day_change_pct", "industry", "run_date"
+        "last_close", "thirty_day_change_pct", "industry", "run_date", "weighted_score"
     ]
     
     # Ensure all required columns exist, adding them with None if they don't

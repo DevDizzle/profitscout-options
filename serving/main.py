@@ -18,13 +18,11 @@ from core.pipelines import (
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# --- ADD THIS NEW FUNCTION ---
 @functions_framework.http
 def run_performance_tracker_updater(request):
     """Runs the daily snapshot process for the performance tracker."""
     performance_tracker_updater.run_pipeline()
     return "Performance tracker update pipeline finished.", 200
-# -----------------------------
 
 @functions_framework.http
 def run_winners_dashboard_generator(request):

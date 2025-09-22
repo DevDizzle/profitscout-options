@@ -8,24 +8,39 @@ from google.cloud import bigquery, storage
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from .. import config, bq, gcs
 
-def _copy_blob(blob, source_bucket, destination_bucket, overwrite: bool = False):
+def _delete_gcs_prefix(bucket: storage.Bucket, prefix: str):
     """
-    Worker function to copy a single blob.
+    Deletes all blobs under a given prefix in a GCS bucket.
     """
     try:
+        blobs_to_delete = list(bucket.list_blobs(prefix=prefix))
+        if not blobs_to_delete:
+            logging.info(f"No blobs found to delete in prefix: gs://{bucket.name}/{prefix}")
+            return
+        
+        logging.info(f"Deleting {len(blobs_to_delete)} blobs from gs://{bucket.name}/{prefix}")
+        # Use bucket.delete_blobs for efficient batch deletion
+        for blob in blobs_to_delete:
+            blob.delete()
+        logging.info(f"Successfully deleted blobs from prefix: gs://{bucket.name}/{prefix}")
+    except Exception as e:
+        logging.error(f"Failed to delete blobs in prefix {prefix}: {e}", exc_info=True)
+        # Halt the process if deletion fails to prevent stale data.
+        raise
+
+def _copy_blob(blob, source_bucket, destination_bucket):
+    """
+    Worker function to copy a single blob. 'overwrite' is always true in this workflow.
+    """
+    try:
+        source_blob = source_bucket.blob(blob.name)
         destination_blob = destination_bucket.blob(blob.name)
         
-        if not overwrite and destination_blob.exists():
-            logging.info(f"Skipping copy, blob already exists: {blob.name}")
-            return None
-
-        source_blob = source_bucket.blob(blob.name)
         token, _, _ = destination_blob.rewrite(source_blob)
         while token is not None:
             token, _, _ = destination_blob.rewrite(source_blob, token=token)
 
-        action = "Overwrote" if overwrite else "Copied"
-        logging.info(f"Successfully {action} {blob.name}")
+        logging.info(f"Successfully copied {blob.name}")
         return blob.name
     except Exception as e:
         logging.error(f"Failed to copy {blob.name}: {e}", exc_info=True)
@@ -34,42 +49,64 @@ def _copy_blob(blob, source_bucket, destination_bucket, overwrite: bool = False)
 
 def _sync_gcs_data():
     """
-    Copies all necessary asset files from the source to the destination bucket.
+    Performs a full wipe-and-replace sync for all necessary GCS folders.
+    This erases all old data in the destination prefixes before copying fresh data.
     """
     storage_client = storage.Client()
     source_bucket = storage_client.bucket(config.GCS_BUCKET_NAME, user_project=config.SOURCE_PROJECT_ID)
     destination_bucket = storage_client.bucket(config.DESTINATION_GCS_BUCKET_NAME, user_project=config.DESTINATION_PROJECT_ID)
     
-    prefixes_to_sync = [
+    # A single, comprehensive list of all folders to be completely refreshed daily.
+    all_prefixes_to_sync = [
+        "dashboards/",
+        "financial-statements/",
+        "headline-news/",
+        "images/",
+        "key-metrics/",
+        "news-analysis/",
+        "pages/",
         "price-chart-json/",
-        "sec-business/", "headline-news/", "sec-mda/",
-        "financial-statements/", "earnings-call-transcripts/",
-        "recommendations/", "pages/", "dashboards/", "images/",
-        "fundamentals-analysis/"
+        "ratios/",
+        "recommendations/",
+        "sec-business/",
+        "sec-mda/",
+        "sec-risk/",
+        "technicals/",
     ]
-    prefixes_to_overwrite = ["technicals/"]
 
-    logging.info("Starting GCS data sync...")
+
+    logging.info("--- Starting FULL Wipe-and-Replace GCS Sync ---")
+
+    # Step 1: Wipe ALL destination folders for a clean copy.
+    logging.info(f"Wiping {len(all_prefixes_to_sync)} destination prefixes...")
+    with ThreadPoolExecutor(max_workers=config.MAX_WORKERS_BUNDLER, thread_name_prefix="Deleter") as executor:
+        delete_futures = [executor.submit(_delete_gcs_prefix, destination_bucket, prefix) for prefix in all_prefixes_to_sync]
+        for future in as_completed(delete_futures):
+            try:
+                future.result() # Wait for deletions to complete.
+            except Exception as e:
+                logging.critical(f"A critical error occurred during GCS prefix deletion, halting sync: {e}", exc_info=True)
+                # Stop the entire process if we can't guarantee a clean slate.
+                raise RuntimeError("GCS prefix deletion failed, aborting sync to prevent data inconsistency.") from e
+
+    logging.info("Wipe complete. Starting full file copy process...")
     
+    # Step 2: List all source blobs and copy them.
     copied_count = 0
-    with ThreadPoolExecutor(max_workers=config.MAX_WORKERS_BUNDLER) as executor:
-        blobs_to_sync = [blob for prefix in prefixes_to_sync for blob in source_bucket.list_blobs(prefix=prefix)]
-        future_to_blob_sync = {
-            executor.submit(_copy_blob, blob, source_bucket, destination_bucket, overwrite=False): blob 
-            for blob in blobs_to_sync
+    with ThreadPoolExecutor(max_workers=config.MAX_WORKERS_BUNDLER, thread_name_prefix="Copier") as executor:
+        all_blobs_to_copy = [blob for prefix in all_prefixes_to_sync for blob in source_bucket.list_blobs(prefix=prefix)]
+        logging.info(f"Found {len(all_blobs_to_copy)} total files to copy.")
+
+        future_to_blob = {
+            executor.submit(_copy_blob, blob, source_bucket, destination_bucket): blob 
+            for blob in all_blobs_to_copy
         }
         
-        blobs_to_overwrite = [blob for prefix in prefixes_to_overwrite for blob in source_bucket.list_blobs(prefix=prefix)]
-        future_to_blob_overwrite = {
-            executor.submit(_copy_blob, blob, source_bucket, destination_bucket, overwrite=True): blob
-            for blob in blobs_to_overwrite
-        }
-        
-        for future in as_completed({**future_to_blob_sync, **future_to_blob_overwrite}):
+        for future in as_completed(future_to_blob):
             if future.result():
                 copied_count += 1
 
-    logging.info(f"GCS data sync finished. Copied or overwrote {copied_count} files.")
+    logging.info(f"GCS full sync finished. Copied {copied_count} files.")
 
 
 def _get_latest_daily_files_map() -> Dict[str, Dict[str, str]]:
@@ -175,8 +212,6 @@ def _assemble_final_metadata(work_list_df: pd.DataFrame, scores_df: pd.DataFrame
         
         record["image_uri"] = f"gs://{config.DESTINATION_GCS_BUCKET_NAME}/images/{ticker}.png"
 
-        # --- THIS IS THE FIX ---
-        # The logic is now simpler because we expect clean floats from the KPI file.
         ticker_kpis = kpis_map.get(ticker, {})
         
         try:
@@ -184,7 +219,6 @@ def _assemble_final_metadata(work_list_df: pd.DataFrame, scores_df: pd.DataFrame
             record["thirty_day_change_pct"] = float(ticker_kpis.get("thirty_day_change_pct")) if ticker_kpis.get("thirty_day_change_pct") is not None else None
             record["weighted_score"] = float(row.get("weighted_score")) if row.get("weighted_score") is not None else None
         except (ValueError, TypeError):
-            # Fallback in case of unexpected non-numeric data
             record["price"] = record.get("price")
             record["thirty_day_change_pct"] = record.get("thirty_day_change_pct")
             record["weighted_score"] = record.get("weighted_score")
