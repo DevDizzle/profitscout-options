@@ -26,9 +26,10 @@ def _get_all_price_histories(tickers: list[str]) -> dict[str, pd.DataFrame]:
         return {}
     
     client = bigquery.Client(project=config.SOURCE_PROJECT_ID)
-    # We need at least 200 days of data to calculate the 200-day SMA, plus 90 days for the chart.
-    # Fetching a bit more to be safe.
-    start_date = date.today() - pd.Timedelta(days=365)
+    # --- THIS IS THE FIX ---
+    # Increased lookback period to 450 days to ensure the 200-day SMA
+    # has a sufficient "warm-up" period for the 90-day chart view.
+    start_date = date.today() - pd.Timedelta(days=450)
     
     query = f"""
         SELECT ticker, date, open, high, low, adj_close, volume

@@ -40,7 +40,51 @@ def _delete_old_prep_files(ticker: str):
         except Exception as e:
             logging.error(f"[{ticker}] Failed to delete old prep file {blob_name}: {e}")
 
-def _fetch_and_calculate_kpis(ticker: str) -> Optional[str]:
+# --- NEW: Function to get industry performance ---
+def _get_industry_performance_map(client: bigquery.Client) -> Dict[str, float]:
+    """
+    Calculates the average 30-day price change for every industry.
+    This is done once to avoid querying repeatedly for each ticker.
+    """
+    logging.info("Calculating industry average 30-day performance...")
+    query = f"""
+    WITH LatestData AS (
+        SELECT
+            a.ticker,
+            a.close_30d_delta_pct,
+            m.industry
+        FROM `{config.SOURCE_PROJECT_ID}.{config.BIGQUERY_DATASET}.options_analysis_input` a
+        JOIN (
+            -- Get the most recent metadata for each ticker
+            SELECT ticker, industry, ROW_NUMBER() OVER(PARTITION BY ticker ORDER BY quarter_end_date DESC) as rn
+            FROM `{config.BUNDLER_STOCK_METADATA_TABLE_ID}`
+        ) m ON a.ticker = m.ticker AND m.rn = 1
+        WHERE a.date = (SELECT MAX(date) FROM `{config.SOURCE_PROJECT_ID}.{config.BIGQUERY_DATASET}.options_analysis_input`)
+          AND m.industry IS NOT NULL
+          AND a.close_30d_delta_pct IS NOT NULL
+    )
+    SELECT
+        industry,
+        AVG(close_30d_delta_pct) as avg_industry_change
+    FROM LatestData
+    GROUP BY industry
+    """
+    try:
+        df = client.query(query).to_dataframe()
+        if df.empty:
+            logging.warning("Could not calculate industry performance averages.")
+            return {}
+        
+        # Convert to a dictionary for easy lookup: {'IndustryName': avg_change_pct}
+        perf_map = df.set_index('industry')['avg_industry_change'].to_dict()
+        logging.info(f"Successfully calculated performance for {len(perf_map)} industries.")
+        return perf_map
+    except Exception as e:
+        logging.error(f"Failed to get industry performance map: {e}", exc_info=True)
+        return {}
+
+
+def _fetch_and_calculate_kpis(ticker: str, industry_map: Dict[str, float]) -> Optional[str]:
     """
     Fetches enriched data for a single ticker and calculates the main KPIs.
     """
@@ -49,6 +93,7 @@ def _fetch_and_calculate_kpis(ticker: str) -> Optional[str]:
     final_json = {"ticker": ticker, "runDate": run_date_str, "kpis": {}}
 
     try:
+        # --- MODIFIED: Query now joins to get industry directly ---
         enriched_query = f"""
             WITH latest_analysis AS (
                 SELECT *
@@ -66,12 +111,21 @@ def _fetch_and_calculate_kpis(ticker: str) -> Optional[str]:
                   AND date >= DATE_SUB((SELECT date FROM latest_analysis), INTERVAL 30 DAY)
                   AND date <= (SELECT date FROM latest_analysis)
                 GROUP BY ticker
+            ),
+            metadata AS (
+                SELECT industry
+                FROM `{config.BUNDLER_STOCK_METADATA_TABLE_ID}`
+                WHERE ticker = @ticker
+                ORDER BY quarter_end_date DESC
+                LIMIT 1
             )
             SELECT
                 a.*,
-                v.avg_volume_30d
+                v.avg_volume_30d,
+                m.industry
             FROM latest_analysis a
             LEFT JOIN avg_volume v ON a.ticker = v.ticker
+            CROSS JOIN metadata m
         """
         job_config = bigquery.QueryJobConfig(query_parameters=[bigquery.ScalarQueryParameter("ticker", "STRING", ticker)])
         enriched_df = client.query(enriched_query, job_config=job_config).to_dataframe()
@@ -83,7 +137,7 @@ def _fetch_and_calculate_kpis(ticker: str) -> Optional[str]:
 
         latest_row = enriched_df.iloc[0]
 
-        # --- KPI 1: Trend Strength ---
+        # --- KPI 1: Trend Strength (No change) ---
         price = latest_row.get('adj_close')
         sma50 = latest_row.get('latest_sma50')
         price_date = latest_row.get('date')
@@ -99,17 +153,21 @@ def _fetch_and_calculate_kpis(ticker: str) -> Optional[str]:
                 "tooltip": "Compares the previous day's closing price to the 50-day moving average to identify the current trend."
             }
 
-        # --- KPI 2: RSI (Relative Strength Index) ---
-        rsi = latest_row.get('latest_rsi')
-        if pd.notna(rsi):
-            signal = "overbought" if rsi > 70 else "oversold" if rsi < 30 else "neutral"
-            final_json["kpis"]["rsi"] = {
-                "value": round(rsi, 2),
+        # --- KPI 2: RSI Momentum (NEW AND IMPROVED) ---
+        latest_rsi = latest_row.get('latest_rsi')
+        rsi_delta = latest_row.get('rsi_30d_delta')
+        if pd.notna(latest_rsi) and pd.notna(rsi_delta):
+            rsi_30_days_ago = latest_rsi - rsi_delta
+            signal = "strengthening" if rsi_delta > 1 else "weakening" if rsi_delta < -1 else "stable"
+            
+            final_json["kpis"]["rsiMomentum"] = {
+                "currentRsi": round(latest_rsi, 2),
+                "rsi30DaysAgo": round(rsi_30_days_ago, 2),
                 "signal": signal,
-                "tooltip": "Indicates if a stock is overbought (>70) or oversold (<30)."
+                "tooltip": "Compares the current 14-day RSI to its value 30 days ago to gauge momentum."
             }
 
-        # --- KPI 3: Volume Surge ---
+        # --- KPI 3: Volume Surge (MODIFIED FOR CLARITY) ---
         volume = latest_row.get('volume')
         avg_volume = latest_row.get('avg_volume_30d')
         if pd.notna(volume) and pd.notna(avg_volume) and avg_volume > 0:
@@ -117,32 +175,46 @@ def _fetch_and_calculate_kpis(ticker: str) -> Optional[str]:
             final_json["kpis"]["volumeSurge"] = {
                 "value": round(surge_pct, 2),
                 "signal": "high" if surge_pct > 50 else "normal",
-                "tooltip": "Today's volume versus its 30-day average."
+                "volume": int(volume),
+                "avgVolume30d": int(round(avg_volume, 0)),
+                "tooltip": "The percentage difference between the most recent trading day's volume and its 30-day average volume."
             }
-
-        # --- THIS IS THE FIX ---
-        # --- KPI 4: 30-Day Historical Volatility (HV) ---
+        
+        # --- KPI 4: Historical Volatility (No change) ---
         hv_30 = latest_row.get('hv_30')
         if pd.notna(hv_30):
             final_json["kpis"]["historicalVolatility"] = {
-                "value": round(hv_30 * 100, 2), # Convert to percentage number
+                "value": round(hv_30 * 100, 2),
                 "signal": "high" if hv_30 > 0.5 else "low" if hv_30 < 0.2 else "moderate",
                 "tooltip": "The stock's actual (realized) volatility over the last 30 days."
             }
         
-        # --- KPI 5: 30-Day Price Change ---
+        # --- KPI 5: 30-Day Price Change (MODIFIED WITH INDUSTRY COMPARISON) ---
         change_pct = latest_row.get('close_30d_delta_pct')
+        industry = latest_row.get('industry')
+        industry_avg = industry_map.get(industry) if industry else None
+        
         if pd.notna(change_pct):
+            signal = "positive" if change_pct > 0 else "negative"
+            comparison_signal = None
+            if industry_avg is not None:
+                if change_pct > industry_avg:
+                    comparison_signal = "outperforming"
+                else:
+                    comparison_signal = "underperforming"
+
             final_json["kpis"]["thirtyDayChange"] = {
                 "value": round(change_pct, 2),
-                "signal": "positive" if change_pct > 0 else "negative",
-                "tooltip": "The stock's price change over the last 30 days."
+                "signal": signal,
+                "industryAverage": round(industry_avg, 2) if industry_avg is not None else None,
+                "comparisonSignal": comparison_signal,
+                "tooltip": "The stock's price change over the last 30 days, compared to its industry average."
             }
 
         _delete_old_prep_files(ticker)
         output_blob_name = f"{OUTPUT_PREFIX}{ticker}_{run_date_str}.json"
         gcs.write_text(config.GCS_BUCKET_NAME, output_blob_name, json.dumps(final_json, indent=2))
-        logging.info(f"[{ticker}] Successfully generated and uploaded prep JSON with 5 KPIs.")
+        logging.info(f"[{ticker}] Successfully generated and uploaded prep JSON with enhanced KPIs.")
         return output_blob_name
 
     except Exception as e:
@@ -157,11 +229,16 @@ def run_pipeline():
     if work_list_df.empty:
         logging.warning("No tickers in work list. Exiting.")
         return
+        
+    # --- MODIFIED: Get the industry map once ---
+    client = bigquery.Client(project=config.SOURCE_PROJECT_ID)
+    industry_performance_map = _get_industry_performance_map(client)
 
     processed_count = 0
     with ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix='CruncherWorker') as executor:
+        # Pass the map to each worker
         future_to_ticker = {
-            executor.submit(_fetch_and_calculate_kpis, row['ticker']): row['ticker']
+            executor.submit(_fetch_and_calculate_kpis, row['ticker'], industry_performance_map): row['ticker']
             for _, row in work_list_df.iterrows()
         }
         for future in as_completed(future_to_ticker):

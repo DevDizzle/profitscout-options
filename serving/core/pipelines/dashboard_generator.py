@@ -164,31 +164,44 @@ def process_ticker(prep_blob_name: str) -> Optional[str]:
     ticker, run_date_str = match.groups()
     logging.info(f"[{ticker}] Starting dashboard generation for {run_date_str}...")
 
+    # Initialize all data components with default "empty" values
+    llm_data = {"seo": {}, "teaser": {}}
+    stock_analysis = None
+    price_chart_data = {}
+    enriched_chain_table = []
+
     try:
         prep_json_str = gcs.read_blob(config.GCS_BUCKET_NAME, prep_blob_name)
-        if not prep_json_str: return None
+        if not prep_json_str:
+            logging.warning(f"[{ticker}] Prep file was empty. Skipping.")
+            return None
         prep_data = json.loads(prep_json_str)
 
         metadata = _get_company_metadata(ticker)
         company_name = metadata.get("company_name", ticker)
         
-        prompt = _PROMPT_TEMPLATE.format(
-            ticker=ticker,
-            company_name=company_name,
-            kpis_str=json.dumps(prep_data.get("kpis"), indent=2),
-            example_json=_EXAMPLE_JSON_FOR_LLM
-        )
-        
-        llm_response_str = vertex_ai.generate(prompt)
-        if llm_response_str.strip().startswith("```json"):
-            llm_response_str = re.search(r'\{.*\}', llm_response_str, re.DOTALL).group(0)
-        llm_data = json.loads(llm_response_str)
+        # --- Safely generate LLM content ---
+        try:
+            prompt = _PROMPT_TEMPLATE.format(
+                ticker=ticker,
+                company_name=company_name,
+                kpis_str=json.dumps(prep_data.get("kpis"), indent=2),
+                example_json=_EXAMPLE_JSON_FOR_LLM
+            )
+            llm_response_str = vertex_ai.generate(prompt)
+            if llm_response_str.strip().startswith("```json"):
+                llm_response_str = re.search(r'\{.*\}', llm_response_str, re.DOTALL).group(0)
+            llm_data = json.loads(llm_response_str)
+        except Exception as e:
+            logging.error(f"[{ticker}] Failed to generate or parse LLM content: {e}", exc_info=True)
+            # Use default empty llm_data
 
-        # Assemble all data components
+        # --- Safely assemble all other data components ---
         stock_analysis = _get_stock_analysis(ticker)
         price_chart_data = _get_price_chart_data(ticker)
         enriched_chain_table = _get_options_chain_table(ticker)
 
+        # --- Always assemble the final dashboard ---
         final_dashboard = {
             "ticker": ticker,
             "runDate": run_date_str,
@@ -211,30 +224,22 @@ def process_ticker(prep_blob_name: str) -> Optional[str]:
         return output_blob_name
 
     except Exception as e:
-        logging.error(f"[{ticker}] Failed during dashboard generation: {e}", exc_info=True)
+        logging.error(f"[{ticker}] A critical error occurred during dashboard generation: {e}", exc_info=True)
+        # In this robust version, we still attempt to write a minimal file if possible,
+        # but for a critical failure like a missing prep file, we will exit.
         return None
 
 def run_pipeline():
-    logging.info("--- Starting Dashboard Generation Pipeline ---")
+    logging.info("--- Starting Dashboard Generation Pipeline (Robust Mode) ---")
     
-    all_prep_files = gcs.list_blobs(config.GCS_BUCKET_NAME, prefix=PREP_PREFIX)
-    all_dashboard_files = set(gcs.list_blobs(config.GCS_BUCKET_NAME, prefix=OUTPUT_PREFIX))
+    # --- MODIFIED: Process ALL prep files ---
+    work_items = gcs.list_blobs(config.GCS_BUCKET_NAME, prefix=PREP_PREFIX)
     
-    work_items = []
-    for prep_path in all_prep_files:
-        try:
-            ticker, run_date = re.search(r'prep/([A-Z\.]+)_(\d{4}-\d{2}-\d{2})\.json$', prep_path).groups()
-            expected_dashboard_path = f"{OUTPUT_PREFIX}{ticker}_dashboard_{run_date}.json"
-            if expected_dashboard_path not in all_dashboard_files:
-                work_items.append(prep_path)
-        except (AttributeError, IndexError):
-            continue
-
     if not work_items:
-        logging.info("All prep files have a corresponding dashboard JSON. Nothing to do.")
+        logging.info("No prep files found to process. Nothing to do.")
         return
 
-    logging.info(f"Found {len(work_items)} new prep files to process into dashboards.")
+    logging.info(f"Found {len(work_items)} prep files to process into dashboards.")
     processed_count = 0
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_item = {executor.submit(process_ticker, item): item for item in work_items}
@@ -245,7 +250,7 @@ def run_pipeline():
             except Exception as exc:
                 logging.error(f"Item {future_to_item[future]} generated an unhandled exception: {exc}", exc_info=True)
     
-    logging.info(f"--- Dashboard Generation Pipeline Finished. Processed {processed_count} of {len(work_items)} new dashboards. ---")
+    logging.info(f"--- Dashboard Generation Pipeline Finished. Processed {processed_count} of {len(work_items)} dashboards. ---")
 
 if __name__ == "__main__":
     run_pipeline()

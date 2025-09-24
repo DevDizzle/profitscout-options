@@ -14,6 +14,7 @@ from core.pipelines import (
     recommendations_generator,
     winners_dashboard_generator,
     performance_tracker_updater,
+    sync_options_candidates_to_firestore,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -93,3 +94,9 @@ def run_sync_to_firestore(request):
             full_reset = True
     sync_to_firestore.run_pipeline(full_reset=full_reset)
     return f"Sync to Firestore pipeline finished. Full reset: {full_reset}", 200
+
+@functions_framework.http
+def run_sync_options_candidates_to_firestore(request):
+    """Syncs the latest options candidates to Firestore."""
+    sync_options_candidates_to_firestore.run_pipeline()
+    return "Sync options candidates to Firestore pipeline finished.", 200

@@ -1,4 +1,3 @@
-# serving/core/pipelines/recommendations_generator.py
 import logging
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -28,8 +27,6 @@ Oracle provides comprehensive enterprise IT solutions, including cloud applicati
 - 🚩 Rising debt (now over $105B) and negative free cash flow are key watch items.
 
 Overall: A Strongly Bullish outlook is warranted based on fundamentals, but traders should be aware of the negative short-term price momentum.
-
-💡 Help shape the future: share your feedback to guide our next update.
 """
 
 # --- Updated: New Prompt accepting the richer signal context ---
@@ -50,7 +47,6 @@ Your tone should be clear, professional, and concise. Your goal is to give users
 - **Profile & Key Highlights**: Use "### Profile" and "### Key Highlights" headers.
 - **Bullets**: Use Markdown dashes (`- `). Start each bullet with one emoji (📈 bullish, 🚩 bearish, ⚖️ mixed/conflicting). Each bullet must be a concise, data-driven insight from the input text. Cite specific numbers and trends.
 - **Overall**: One sentence that reconciles the momentum view with the fundamental context.
-- **Hook**: Close with a single call-to-action encouraging feedback.
 
 ### Input Data
 - **Outlook Signal**: {outlook_signal}

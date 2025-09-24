@@ -55,7 +55,8 @@ def _get_strong_stock_recommendations() -> pd.DataFrame:
     
     latest_df = filtered_df.sort_values('run_date', ascending=False).drop_duplicates('ticker')
     
-    return latest_df
+    # We only need the ticker and the specific signal information from this step
+    return latest_df[['ticker', 'outlook_signal', 'run_date']]
 
 def _get_strong_options_setups() -> pd.DataFrame:
     """
@@ -76,13 +77,14 @@ def _get_strong_options_setups() -> pd.DataFrame:
         logging.error(f"Failed to query strong options setups: {e}")
         return pd.DataFrame()
 
-def _get_asset_metadata(tickers: list) -> pd.DataFrame:
+def _get_asset_metadata_for_winners(tickers: list) -> pd.DataFrame:
     """
-    Fetches the asset metadata for a specific list of tickers.
+    Fetches all required asset metadata for the final list of winner tickers.
     """
+    if not tickers:
+        return pd.DataFrame()
+        
     client = bigquery.Client(project=config.SOURCE_PROJECT_ID)
-    # --- THIS IS THE FIX ---
-    # Simplified the query to a direct select since we only have one row per ticker.
     query = f"""
         SELECT
             ticker,
@@ -124,27 +126,29 @@ def run_pipeline():
         logging.warning("No tickers with strong options setups found. Aborting.")
         return
 
+    # Step 1: Find the tickers that are in BOTH lists.
     winners_df = pd.merge(strong_recs_df, strong_options_df, on='ticker', how='inner')
+
     if winners_df.empty:
         logging.warning("No tickers matched between strong recommendations and strong options. Final table will be empty.")
-        # We still proceed to write an empty dataframe to truncate the table.
+        bq.load_df_to_bq(pd.DataFrame(columns=[
+            "image_uri", "company_name", "ticker", "outlook_signal",
+            "last_close", "thirty_day_change_pct", "industry", "run_date", "weighted_score"
+        ]), OUTPUT_TABLE_ID, config.SOURCE_PROJECT_ID, write_disposition="WRITE_TRUNCATE")
+        return
         
-    # Only fetch metadata if we have winners to enrich
-    if not winners_df.empty:
-        winner_tickers = winners_df['ticker'].tolist()
-        asset_metadata_df = _get_asset_metadata(winner_tickers)
-        if not asset_metadata_df.empty:
-            final_df = pd.merge(winners_df, asset_metadata_df, on='ticker', how='left')
-        else:
-            logging.warning("No asset metadata found for winning tickers. Final table may have missing columns.")
-            final_df = winners_df
-    else:
-        final_df = winners_df
+    # Step 2: Get all the metadata for these winner tickers in a single call.
+    winner_tickers = winners_df['ticker'].tolist()
+    asset_metadata_df = _get_asset_metadata_for_winners(winner_tickers)
 
-    # Rename for consistency with the final schema
-    if "price" in final_df.columns:
-        final_df = final_df.rename(columns={"price": "last_close"})
+    if asset_metadata_df.empty:
+        logging.error("Could not retrieve asset metadata for the winning tickers. Aborting.")
+        return
 
+    # Step 3: Join the recommendation info (like outlook_signal) with the full metadata.
+    final_df = pd.merge(winners_df, asset_metadata_df, on='ticker', how='left')
+
+    # Define the final, exact schema for the table.
     final_columns = [
         "image_uri", "company_name", "ticker", "outlook_signal",
         "last_close", "thirty_day_change_pct", "industry", "run_date", "weighted_score"

@@ -80,15 +80,15 @@ def _load_bq_df(bq: bigquery.Client, query: str) -> pd.DataFrame:
 
 def run_pipeline(full_reset: bool = False):
     """
-    Syncs the rolling 90-day forward calendar from BigQuery to Firestore.
+    Syncs the rolling 90-day forward calendar from BigQuery to Firestore
+    using a simple, flat data structure.
     """
     db = firestore.Client(project=config.DESTINATION_PROJECT_ID)
     bq = bigquery.Client(project=config.SOURCE_PROJECT_ID)
 
     collection_ref = db.collection(FIRESTORE_COLLECTION_NAME)
-    logging.info(f"--- Calendar Events Firestore Sync Pipeline ---")
+    logging.info(f"--- Calendar Events Firestore Sync Pipeline (Flat Structure) ---")
     logging.info(f"Target collection: {collection_ref.id}")
-    logging.info(f"Full reset? {'YES' if full_reset else 'NO'}")
 
     try:
         # Only future events (rolling forward view)
@@ -102,6 +102,7 @@ def run_pipeline(full_reset: bool = False):
         logging.critical(f"Failed to query calendar events from BigQuery: {e}", exc_info=True)
         raise
 
+    # Always wipe the collection to ensure it's a perfect mirror of the query
     _delete_collection_in_batches(db, collection_ref)
 
     if calendar_df.empty:
@@ -109,42 +110,24 @@ def run_pipeline(full_reset: bool = False):
         logging.info("--- Calendar Events Firestore Sync Pipeline Finished ---")
         return
 
-    # --- THIS IS THE CORRECT LOGIC ---
-    # It correctly uses the "entity" column for the ticker and falls back to "event_type" for non-stock events.
-    collection_ids = []
-    for _, row in calendar_df.iterrows():
-        raw_id = row.get("entity") or row.get("event_type") or "UNKNOWN"
-        collection_ids.append(_sanitize_id(str(raw_id), fallback="UNKNOWN"))
-    calendar_df["collection_id"] = collection_ids
-
-    # Prepare batched upserts
+    # --- THIS IS THE NEW, SIMPLER LOGIC ---
+    # Prepare batched upserts with a flat structure
     upsert_ops = []
-    for collection_id, group in calendar_df.groupby("collection_id"):
-        parent_doc_ref = collection_ref.document(collection_id)
-        events_collection_ref = parent_doc_ref.collection("events")
+    for _, row in calendar_df.iterrows():
+        # Use the event_id as the document ID
+        event_doc_id = _sanitize_id(str(row.get("event_id")), fallback=None)
+        if not event_doc_id:
+            logging.warning(f"Skipping event with missing event_id: {row.to_dict()}")
+            continue
 
-        for _, row in group.iterrows():
-            event_doc_id = _sanitize_id(str(row["event_id"]), fallback=None)
-            if not event_doc_id:
-                continue
+        # The document reference is now at the top level
+        doc_ref = collection_ref.document(event_doc_id)
+        
+        # The data is simply the content of the row
+        event_data = row.to_dict()
+        upsert_ops.append({"type": "set", "ref": doc_ref, "data": event_data})
 
-            doc_ref = events_collection_ref.document(event_doc_id)
-
-            event_data = {
-                "event_id": row.get("event_id"),
-                "entity": row.get("entity"),
-                "event_type": row.get("event_type"),
-                "event_name": row.get("event_name"),
-                "event_date": row.get("event_date"),
-                "event_time": row.get("event_time"),
-                "source": row.get("source"),
-                "last_seen": row.get("last_seen"),
-                "collection_id": collection_id,
-            }
-
-            upsert_ops.append({"type": "set", "ref": doc_ref, "data": event_data})
-
-    logging.info(f"Upserting {len(upsert_ops)} documents to '{collection_ref.id}'...")
+    logging.info(f"Upserting {len(upsert_ops)} event documents to '{collection_ref.id}'...")
     for chunk in _iter_batches(upsert_ops, BATCH_SIZE):
         _commit_ops(db, chunk)
 

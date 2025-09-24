@@ -1,4 +1,3 @@
-# serving/core/pipelines/page_generator.py
 import logging
 import pandas as pd
 import json
@@ -14,8 +13,9 @@ from ..clients import vertex_ai
 
 INPUT_PREFIX = config.RECOMMENDATION_PREFIX
 OUTPUT_PREFIX = config.PAGE_JSON_PREFIX
+PREP_PREFIX = 'prep/'  # For KPI JSON path
 
-# --- Updated Example (momentum-led tone preserved) ---
+# --- Updated Example (includes aiOptionsPicks) ---
 _EXAMPLE_JSON_FOR_LLM = """
 {
   "seo": {
@@ -24,7 +24,7 @@ _EXAMPLE_JSON_FOR_LLM = """
     "keywords": ["Expedia Group stock", "EXPE stock analysis", "Is EXPE a buy", "AI stock signals 2025", "EXPE technicals"]
   },
   "teaser": {
-    "signal": "BUY",
+    "signal": "Moderately Bullish outlook encountering short-term weakness",
     "summary": "EXPE shows a momentum breakout supported by positive headlines and stable fundamentals.",
     "metrics": {
       "Price Trend": "Uptrend with higher highs",
@@ -32,51 +32,60 @@ _EXAMPLE_JSON_FOR_LLM = """
       "Guidance Tone": "Improving quarter over quarter"
     }
   },
-  "relatedStocks": ["BKNG", "ABNB", "TRIP"]
+  "relatedStocks": ["BKNG", "ABNB", "TRIP"],
+  "aiOptionsPicks": [
+    {
+      "strategy": "Buy Call",
+      "rationale": "Bullish outlook with positive momentum supports upside bet.",
+      "details": {"expiration": "2025-10-18", "strike": 150, "premium": "5.00 (est)", "impliedVol": "30% (from hist vol)"},
+      "riskReward": {"maxLoss": "Premium paid", "breakeven": "Strike + premium", "potential": "Profits if stock rises"}
+    }
+  ]
 }
 """
 
-# --- Updated Prompt (aligns thresholds + momentum emphasis) ---
+# --- Updated Prompt (with new signal policy handled by LLM) ---
 _PROMPT_TEMPLATE = r"""
-You are an expert financial copywriter and SEO analyst. Your task is to generate a specific JSON object with compelling SEO metadata, a teaser summary, and related stocks based on the provided analysis.
+You are an expert financial copywriter and SEO analyst specializing in AI-powered options trades. Your task is to generate a JSON object with SEO metadata, a teaser, related stocks, and AI-curated options picks (simple buy calls/puts) based on the provided analysis, KPIs, and recommendation.
 
-### Signal Policy (align with momentum-led framework)
-Use the `weighted_score` to set the final recommendation signal:
-- `weighted_score` > 0.62 → "BUY"
-- `weighted_score` between 0.44 and 0.62 → "HOLD"
-- `weighted_score` < 0.44 → "SELL"
+### Signal Policy (Momentum-Led)
+Compute the outlook from weighted_score:
+- >0.75: "Strongly Bullish"
+- 0.60-0.74: "Moderately Bullish"
+- 0.40-0.59: "Neutral / Mixed"
+- 0.25-0.39: "Moderately Bearish"
+- <0.25: "Strongly Bearish"
 
-### Momentum Emphasis
-- Treat this analysis as **momentum-led** (weights tilt toward Technicals + News).
-- Lead the teaser summary with momentum context (trend, breakouts, volume, breadth).
-- If momentum and fundamentals conflict, reflect that tension concisely in the summary.
+Add momentum context if applicable (using thirtyDayChange.value from KPIs as momentum_pct):
+- For Bullish outlook: if momentum_pct >0, "with confirming positive momentum."; else "encountering short-term weakness."
+- For Bearish outlook: if momentum_pct <0, "with confirming negative momentum."; else "encountering a short-term rally."
+- Neutral: No context.
+
+Use the full computed "outlook + context" as teaser.signal. Momentum-led: Prioritize technicals/KPIs (trend, RSI, volatility) for direction/rationale.
+
+### Options Focus
+- Generate "aiOptionsPicks" as array (0-2 items). Bullish outlook → "Buy Call"; Bearish → "Buy Put"; Neutral → empty array.
+- Each pick: ATM around current price (~{price} from KPIs). Rationale ties to KPIs/MD (e.g., high volatility for premiums, bearish trend for puts). Use placeholders for details (strike, premium, IV, volume)—assume near-term exp (e.g., next month).
+- Nuance with context: e.g., "short-term weakness" in bullish → secondary put for hedge; "short-term rally" in bearish → secondary call for bounce.
+- No complex trades; keep actionable for dashboard users.
 
 ### Instructions
-1) **SEO Title** (60–70 chars)
-   - Frame as a question or bold, insightful statement.
-   - Must include full company name "{{company_name}}" and ticker "({{ticker}})".
-   - End with "| ProfitScout".
-
-2) **Teaser Section**
-   - `signal`: Use the signal from the policy above.
-   - `summary`: A sharp 1–2 sentence momentum-led outlook using the aggregated text.
-   - `metrics`: **Exactly 3** high-signal items. Prefer at least **one momentum indicator** (e.g., trend/breakout/volume/breadth/RSI/MA cross), plus 1–2 from earnings tone, guidance, or fundamentals.
-
-3) **Related Stocks**
-   - Infer **2–3** direct public competitor tickers from the "About" section in the aggregated text.
-
-4) **Format**
-   - Output **ONLY** the JSON object that matches the example structure exactly.
+1) **SEO Title** (60–70 chars): Question/statement with company/ticker + options/outlook angle, end "| ProfitScout".
+2) **Teaser**: signal as computed above; summary (1-2 sentences, momentum-led with options hint); exactly 3 metrics from KPIs/MD (include 1 momentum like RSI/volatility/trend).
+3) **Related Stocks**: 2–3 competitors from "About".
+4) **aiOptionsPicks**: Array of objects with strategy, rationale, details (exp, strike, premium placeholder, IV from volatility), riskReward (max loss=premium, breakeven).
 
 ### Input Data
 - **Ticker**: {ticker}
 - **Company Name**: {company_name}
 - **Current Year**: {year}
 - **Weighted Score**: {weighted_score}
-- **Full Aggregated Analysis (Text)**:
-{aggregated_text}
+- **Momentum Pct (thirtyDayChange.value from KPIs)**: {momentum_pct}
+- **KPIs (Dashboard Metrics)**: {kpis_json}
+- **Recommendation MD (Outlook)**: {recommendation_md}
+- **Full Aggregated Analysis**: {aggregated_text}
 
-### Example Output (Return ONLY this JSON structure)
+### Example Output (ONLY JSON)
 {example_json}
 """
 
@@ -89,14 +98,13 @@ def _split_aggregated_text(aggregated_text: str) -> Dict[str, str]:
         if match:
             key = match.group(1).lower().replace(' ', '')
             text = match.group(2).strip()
-            # --- THIS IS THE MODIFIED SECTION ---
             key_map = {
                 "news": "newsSummary",
                 "technicals": "technicals",
                 "mda": "mdAndA",
                 "transcript": "earningsCall",
                 "financials": "financials",
-                "fundamentals": "fundamentals" # <-- ADDED
+                "fundamentals": "fundamentals"
             }
             final_key = key_map.get(key, key)
             section_dict[final_key] = text
@@ -144,7 +152,6 @@ def _delete_old_page_files(ticker: str):
         except Exception as e:
             logging.error(f"[{ticker}] Failed to delete old page file {blob_name}: {e}")
 
-
 def process_blob(blob_name: str) -> Optional[str]:
     """
     Processes one recommendation blob to generate a page JSON.
@@ -177,17 +184,33 @@ def process_blob(blob_name: str) -> Optional[str]:
         "fullAnalysis": full_analysis_sections
     }
 
+    # Fetch KPI JSON and MD from GCS
+    kpi_path = f"{PREP_PREFIX}{ticker}_{run_date_str}.json"
+    recommendation_md = gcs.read_text(config.GCS_BUCKET_NAME, blob_name)
+    try:
+        kpis_json = json.loads(gcs.read_text(config.GCS_BUCKET_NAME, kpi_path))
+    except Exception as e:
+        logging.error(f"[{ticker}] Failed to fetch KPI JSON: {e}")
+        kpis_json = {}
+
+    # Extract momentum_pct for prompt
+    momentum_pct = kpis_json.get('kpis', {}).get('thirtyDayChange', {}).get('value', None)
+
     prompt = _PROMPT_TEMPLATE.format(
         ticker=ticker,
         company_name=company_name,
         year=date.today().year,
         weighted_score=round(weighted_score, 4),
+        momentum_pct=momentum_pct if momentum_pct is not None else 'None',
+        price=kpis_json.get('kpis', {}).get('trendStrength', {}).get('price', 'N/A'),
+        kpis_json=json.dumps(kpis_json, indent=2),
+        recommendation_md=recommendation_md,
         aggregated_text=aggregated_text,
         example_json=_EXAMPLE_JSON_FOR_LLM,
     )
 
     json_blob_path = f"{OUTPUT_PREFIX}{ticker}_page_{run_date_str}.json"
-    logging.info(f"[{ticker}] Generating SEO/Teaser JSON for {run_date_str}.")
+    logging.info(f"[{ticker}] Generating SEO/Teaser/Options JSON for {run_date_str}.")
 
     try:
         llm_response_str = vertex_ai.generate(prompt)
@@ -198,7 +221,7 @@ def process_blob(blob_name: str) -> Optional[str]:
         llm_generated_data = json.loads(llm_response_str)
         final_json.update(llm_generated_data)
 
-        # This is the key: delete old files before writing the new one.
+        # Delete old files before writing the new one.
         _delete_old_page_files(ticker)
         gcs.write_text(config.GCS_BUCKET_NAME, json_blob_path, json.dumps(final_json, indent=2), "application/json")
         logging.info(f"[{ticker}] Successfully uploaded complete JSON file to {json_blob_path}")
@@ -219,9 +242,6 @@ def run_pipeline():
     """
     logging.info("--- Starting Page Generation Pipeline ---")
 
-    # --- THIS IS THE FIX ---
-    # We no longer need to check for existing pages. We simply process all
-    # recommendations that are present. The deletion logic is handled inside process_blob.
     work_items = gcs.list_blobs(config.GCS_BUCKET_NAME, prefix=INPUT_PREFIX)
 
     if not work_items:
