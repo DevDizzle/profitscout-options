@@ -1,3 +1,4 @@
+# serving/core/pipelines/recommendations_generator.py
 import logging
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -62,16 +63,19 @@ def _get_signal_and_context(score: float, momentum_pct: float | None) -> tuple[s
     """
     Determines the 5-tier outlook signal and the momentum context.
     """
-    if score > 0.75:
+    # --- THIS IS THE FIX ---
+    # The scoring ranges have been adjusted to prevent any gaps.
+    if score >= 0.75:
         outlook = "Strongly Bullish"
-    elif 0.60 <= score <= 0.74:
+    elif 0.60 <= score < 0.75:
         outlook = "Moderately Bullish"
-    elif 0.40 <= score <= 0.59:
+    elif 0.40 <= score < 0.60:
         outlook = "Neutral / Mixed"
-    elif 0.25 <= score <= 0.39:
+    elif 0.25 <= score < 0.40:
         outlook = "Moderately Bearish"
     else: # score < 0.25
         outlook = "Strongly Bearish"
+
 
     context = ""
     if momentum_pct is not None:
@@ -94,6 +98,7 @@ def _get_daily_work_list() -> list[dict]:
     """
     MODIFIED: Builds the work list from the GCS tickerlist.txt and enriches it
     with the latest available data from BigQuery for each ticker.
+    This version now handles potential duplicate entries by selecting the one with the highest weighted_score.
     """
     logging.info("Fetching work list from GCS and enriching from BigQuery...")
     tickers = gcs.get_tickers()
@@ -103,29 +108,25 @@ def _get_daily_work_list() -> list[dict]:
         
     client = bigquery.Client(project=config.SOURCE_PROJECT_ID)
     
-    # This query fetches the latest data for ALL tickers found in the GCS list.
+    # The query now de-duplicates the data by selecting the record with the highest
+    # `weighted_score` for each ticker on the most recent run date.
     query = f"""
         WITH GCS_Tickers AS (
             SELECT ticker FROM UNNEST(@tickers) AS ticker
         ),
-        LatestScores AS (
+        RankedScores AS (
             SELECT
-                ticker,
-                company_name,
-                weighted_score,
-                aggregated_text
-            FROM (
-                SELECT
-                    t1.ticker,
-                    t2.company_name,
-                    t1.weighted_score,
-                    t1.aggregated_text,
-                    ROW_NUMBER() OVER(PARTITION BY t1.ticker ORDER BY t1.run_date DESC) as rn
-                FROM `{config.SCORES_TABLE_ID}` AS t1
-                JOIN `{config.BUNDLER_STOCK_METADATA_TABLE_ID}` AS t2 ON t1.ticker = t2.ticker
-                WHERE t1.weighted_score IS NOT NULL AND t2.company_name IS NOT NULL
-            )
-            WHERE rn = 1
+                t1.ticker,
+                t2.company_name,
+                t1.weighted_score,
+                t1.aggregated_text,
+                ROW_NUMBER() OVER(PARTITION BY t1.ticker ORDER BY t1.run_date DESC, t1.weighted_score DESC) as rn
+            FROM `{config.SCORES_TABLE_ID}` AS t1
+            JOIN `{config.BUNDLER_STOCK_METADATA_TABLE_ID}` AS t2 ON t1.ticker = t2.ticker
+            WHERE t1.weighted_score IS NOT NULL AND t2.company_name IS NOT NULL
+        ),
+        LatestScores AS (
+            SELECT * FROM RankedScores WHERE rn = 1
         ),
         LatestMomentum AS (
             SELECT
@@ -160,7 +161,6 @@ def _get_daily_work_list() -> list[dict]:
 
     try:
         df = client.query(query, job_config=job_config).to_dataframe()
-        # Filter out tickers that don't have the essential data to proceed
         df.dropna(subset=['company_name', 'weighted_score', 'aggregated_text'], inplace=True)
         if df.empty:
             logging.warning("No tickers with sufficient data found after enriching from BigQuery.")
@@ -194,10 +194,9 @@ def _process_ticker(ticker_data: dict):
     json_blob_path = f"{base_blob_path}.json"
     
     try:
-        # Gracefully handle potentially missing momentum data
         momentum_pct = ticker_data.get("close_30d_delta_pct")
         if pd.isna(momentum_pct):
-            momentum_pct = None # Ensure it's None, not NaN, for the next step
+            momentum_pct = None
 
         outlook_signal, momentum_context = _get_signal_and_context(
             ticker_data["weighted_score"],

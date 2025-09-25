@@ -1,3 +1,4 @@
+# serving/core/pipelines/page_generator.py
 import logging
 import pandas as pd
 import json
@@ -44,50 +45,45 @@ _EXAMPLE_JSON_FOR_LLM = """
 }
 """
 
-# --- Updated Prompt (with new signal policy handled by LLM) ---
+# --- Updated Prompt ---
 _PROMPT_TEMPLATE = r"""
-You are an expert financial copywriter and SEO analyst specializing in AI-powered options trades. Your task is to generate a JSON object with SEO metadata, a teaser, related stocks, and AI-curated options picks (simple buy calls/puts) based on the provided analysis, KPIs, and recommendation.
+You are an expert financial copywriter and SEO analyst specializing in AI-powered options trades. Your task is to generate a JSON object with SEO metadata, a teaser, related stocks, and AI-curated options picks based on the provided analysis.
 
-### Signal Policy (Momentum-Led)
-Compute the outlook from weighted_score:
-- >0.75: "Strongly Bullish"
-- 0.60-0.74: "Moderately Bullish"
-- 0.40-0.59: "Neutral / Mixed"
-- 0.25-0.39: "Moderately Bearish"
-- <0.25: "Strongly Bearish"
-
-Add momentum context if applicable (using thirtyDayChange.value from KPIs as momentum_pct):
-- For Bullish outlook: if momentum_pct >0, "with confirming positive momentum."; else "encountering short-term weakness."
-- For Bearish outlook: if momentum_pct <0, "with confirming negative momentum."; else "encountering a short-term rally."
-- Neutral: No context.
-
-Use the full computed "outlook + context" as teaser.signal. Momentum-led: Prioritize technicals/KPIs (trend, RSI, volatility) for direction/rationale.
+### Signal Policy (Crucial)
+- **Use the Provided Signals**: Your primary directive is to use the `Outlook Signal` and `Momentum Context` provided below.
+- **Combine for Teaser**: The `teaser.signal` MUST be a direct combination of the `Outlook Signal` and the `Momentum Context`. For example: "Strongly Bullish outlook with confirming positive momentum."
+- **Momentum-First Narrative**: Prioritize technicals and KPIs (trend, RSI, volatility) for your rationale, especially for the `aiOptionsPicks`.
 
 ### Options Focus
-- Generate "aiOptionsPicks" as array (0-2 items). Bullish outlook → "Buy Call"; Bearish → "Buy Put"; Neutral → empty array.
-- Each pick: ATM around current price (~{price} from KPIs). Rationale ties to KPIs/MD (e.g., high volatility for premiums, bearish trend for puts). Use placeholders for details (strike, premium, IV, volume)—assume near-term exp (e.g., next month).
-- Nuance with context: e.g., "short-term weakness" in bullish → secondary put for hedge; "short-term rally" in bearish → secondary call for bounce.
-- No complex trades; keep actionable for dashboard users.
+- **Directional Trades**: A "Bullish" `Outlook Signal` should lead to "Buy Call" strategies. A "Bearish" `Outlook Signal` should lead to "Buy Put" strategies. A "Neutral" signal should result in an empty `aiOptionsPicks` array.
+- **Rationale**: The rationale for each pick must tie back to the provided KPIs and analysis.
+- **Hedged Trades (Advanced)**:
+    - If a "Bullish" outlook has "short-term weakness," you can suggest a secondary, speculative "Buy Put" as a hedge.
+    - If a "Bearish" outlook has a "short-term rally," you can suggest a secondary, speculative "Buy Call" to play the bounce.
 
 ### Instructions
-1) **SEO Title** (60–70 chars): Question/statement with company/ticker + options/outlook angle, end "| ProfitScout".
-2) **Teaser**: signal as computed above; summary (1-2 sentences, momentum-led with options hint); exactly 3 metrics from KPIs/MD (include 1 momentum like RSI/volatility/trend).
-3) **Related Stocks**: 2–3 competitors from "About".
-4) **aiOptionsPicks**: Array of objects with strategy, rationale, details (exp, strike, premium placeholder, IV from volatility), riskReward (max loss=premium, breakeven).
+1) **SEO Title**: Create a compelling, 60-70 character title that includes the company name/ticker and an options or outlook angle. End with "| ProfitScout".
+2) **Teaser**:
+    - `signal`: Combine the `Outlook Signal` and `Momentum Context`.
+    - `summary`: Write a 1-2 sentence summary with a clear options hint.
+    - `metrics`: List exactly three key metrics from the provided KPIs or analysis.
+3) **Related Stocks**: Identify 2-3 competitors from the "About" section.
+4) **aiOptionsPicks**: Generate an array of 0-2 options picks. Each pick should include `strategy`, `rationale`, `details` (with placeholders for strike, premium, etc.), and `riskReward`.
 
 ### Input Data
 - **Ticker**: {ticker}
 - **Company Name**: {company_name}
 - **Current Year**: {year}
-- **Weighted Score**: {weighted_score}
-- **Momentum Pct (thirtyDayChange.value from KPIs)**: {momentum_pct}
+- **Outlook Signal**: {outlook_signal}
+- **Momentum Context**: {momentum_context}
 - **KPIs (Dashboard Metrics)**: {kpis_json}
 - **Recommendation MD (Outlook)**: {recommendation_md}
 - **Full Aggregated Analysis**: {aggregated_text}
 
-### Example Output (ONLY JSON)
+### Example Output (JSON only)
 {example_json}
 """
+
 
 def _split_aggregated_text(aggregated_text: str) -> Dict[str, str]:
     """Splits aggregated_text into a dictionary of its component sections."""
@@ -184,9 +180,23 @@ def process_blob(blob_name: str) -> Optional[str]:
         "fullAnalysis": full_analysis_sections
     }
 
-    # Fetch KPI JSON and MD from GCS
-    kpi_path = f"{PREP_PREFIX}{ticker}_{run_date_str}.json"
+    # --- THIS IS THE FIX (Part 1) ---
+    # Fetch recommendation metadata to get the definitive signals.
+    recommendation_json_path = blob_name.replace('.md', '.json')
     recommendation_md = gcs.read_blob(config.GCS_BUCKET_NAME, blob_name)
+    try:
+        rec_json_str = gcs.read_blob(config.GCS_BUCKET_NAME, recommendation_json_path)
+        rec_data = json.loads(rec_json_str) if rec_json_str else {}
+        outlook_signal = rec_data.get("outlook_signal", "Neutral / Mixed")
+        momentum_context = rec_data.get("momentum_context", "")
+    except Exception as e:
+        logging.error(f"[{ticker}] Failed to fetch or parse recommendation JSON: {e}")
+        outlook_signal = "Neutral / Mixed"
+        momentum_context = ""
+
+
+    # Fetch KPI JSON
+    kpi_path = f"{PREP_PREFIX}{ticker}_{run_date_str}.json"
     try:
         kpis_json_str = gcs.read_blob(config.GCS_BUCKET_NAME, kpi_path)
         if kpis_json_str:
@@ -198,21 +208,20 @@ def process_blob(blob_name: str) -> Optional[str]:
         logging.error(f"[{ticker}] Failed to fetch or parse KPI JSON: {e}")
         kpis_json = {}
 
-    # Extract momentum_pct for prompt
-    momentum_pct = kpis_json.get('kpis', {}).get('thirtyDayChange', {}).get('value', None)
-
+    # --- THIS IS THE FIX (Part 2) ---
+    # Update the prompt to pass the definitive signals.
     prompt = _PROMPT_TEMPLATE.format(
         ticker=ticker,
         company_name=company_name,
         year=date.today().year,
-        weighted_score=round(weighted_score, 4) if weighted_score is not None else 0.5,
-        momentum_pct=momentum_pct if momentum_pct is not None else 'None',
-        price=kpis_json.get('kpis', {}).get('trendStrength', {}).get('price', 'N/A'),
+        outlook_signal=outlook_signal,
+        momentum_context=momentum_context,
         kpis_json=json.dumps(kpis_json, indent=2),
         recommendation_md=recommendation_md,
         aggregated_text=aggregated_text,
         example_json=_EXAMPLE_JSON_FOR_LLM,
     )
+
 
     json_blob_path = f"{OUTPUT_PREFIX}{ticker}_page_{run_date_str}.json"
     logging.info(f"[{ticker}] Generating SEO/Teaser/Options JSON for {run_date_str}.")
@@ -229,7 +238,6 @@ def process_blob(blob_name: str) -> Optional[str]:
         llm_generated_data = json.loads(llm_response_str)
         final_json.update(llm_generated_data)
 
-        # Delete old files before writing the new one.
         _delete_old_page_files(ticker)
         gcs.write_text(config.GCS_BUCKET_NAME, json_blob_path, json.dumps(final_json, indent=2), "application/json")
         logging.info(f"[{ticker}] Successfully uploaded complete JSON file to {json_blob_path}")

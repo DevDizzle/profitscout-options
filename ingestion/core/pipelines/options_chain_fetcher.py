@@ -58,7 +58,6 @@ def _coerce_and_align(df: pd.DataFrame, ticker: str, today: date) -> pd.DataFram
     """
     Ensures the DataFrame matches the options_chain schema and types.
     """
-    # ... (no changes in this function)
     rename = {
         "contract_symbol": "contract_symbol", "option_type": "option_type",
         "expiration_date": "expiration_date", "strike": "strike", "last_price": "last_price",
@@ -78,7 +77,16 @@ def _coerce_and_align(df: pd.DataFrame, ticker: str, today: date) -> pd.DataFram
     for c in num_cols:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["expiration_date"] = pd.to_datetime(df["expiration_date"], errors="coerce").dt.date
+            
+    # --- THIS IS THE FIX ---
+    # A more robust method to prevent any timezone-related date shifts.
+    # It extracts the 'YYYY-MM-DD' from the string and converts it directly,
+    # ignoring any problematic time or timezone information.
+    if "expiration_date" in df.columns:
+        date_strings = df['expiration_date'].astype(str).str.slice(0, 10)
+        datetimes = pd.to_datetime(date_strings, format='%Y-%m-%d', errors='coerce')
+        df['expiration_date'] = datetimes.dt.date
+    
     df = df.dropna(subset=["expiration_date", "contract_symbol"])
     df["dte"] = (pd.to_datetime(df["expiration_date"]) - pd.to_datetime(today)).dt.days.astype("Int64")
     df = df[df["dte"] >= 0]
@@ -93,7 +101,6 @@ def _fill_underlying_from_bq_if_needed(bq_client: bigquery.Client, df: pd.DataFr
     """
     If any missing underlying_price values remain, fill from latest adj_close.
     """
-    # ... (no changes in this function)
     if df.empty or not df["underlying_price"].isna().any():
         return df
     q = f"SELECT adj_close FROM `{PRICE_TABLE_ID}` WHERE ticker = @ticker ORDER BY date DESC LIMIT 1"
@@ -115,7 +122,6 @@ def _fetch_and_load_chain_for_ticker(
     """
     Fetch Polygon option chain (≤90d) for ticker, then append to BigQuery.
     """
-    # ... (no changes in this function)
     today = date.today()
     logging.info("[%s] Fetching Polygon chain (≤90d).", ticker)
     raw = client.fetch_options_chain(ticker, max_days=90)
@@ -137,7 +143,6 @@ def run_pipeline(polygon_client: PolygonClient | None = None, bq_client: bigquer
     """
     Main entry: Truncates table, gets all tickers from GCS, and fetches/loads chains.
     """
-    # ... (no changes in this function)
     logging.info("--- Starting Options Chain Fetcher (Polygon) ---")
     bq_client = bq_client or bigquery.Client(project=config.PROJECT_ID)
     polygon_client = polygon_client or PolygonClient(api_key=config.POLYGON_API_KEY)

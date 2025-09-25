@@ -66,6 +66,7 @@ def _sync_gcs_data():
         "news-analysis/",
         "pages/",
         "price-chart-json/",
+        "price-chart-images/", # Add the new image folder
         "ratios/",
         "recommendations/",
         "sec-business/",
@@ -117,7 +118,8 @@ def _get_latest_daily_files_map() -> Dict[str, Dict[str, str]]:
         "news": "headline-news/",
         "recommendation_analysis": "recommendations/",
         "pages_json": "pages/",
-        "dashboard_json": "dashboards/"
+        "dashboard_json": "dashboards/",
+        "price_chart_image_uri": "price-chart-images/" # Add the new image folder
     }
     latest_files = defaultdict(dict)
     
@@ -202,6 +204,7 @@ def _assemble_final_metadata(work_list_df: pd.DataFrame, scores_df: pd.DataFrame
         record["recommendation_analysis"] = daily_files_map.get(ticker, {}).get("recommendation_analysis")
         record["pages_json"] = daily_files_map.get(ticker, {}).get("pages_json")
         record["dashboard_json"] = daily_files_map.get(ticker, {}).get("dashboard_json")
+        record["price_chart_image_uri"] = daily_files_map.get(ticker, {}).get("price_chart_image_uri") # Add new field
         
         record["technicals"] = f"gs://{config.DESTINATION_GCS_BUCKET_NAME}/technicals/{ticker}_technicals.json"
         record["profile"] = f"gs://{config.DESTINATION_GCS_BUCKET_NAME}/sec-business/{ticker}_{quarterly_date_str}.json"
