@@ -1,89 +1,22 @@
 # serving/core/pipelines/dashboard_generator.py
 import logging
-import pandas as pd
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from google.cloud import bigquery
-from datetime import date
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Optional
 
 from .. import config, gcs
-from ..clients import vertex_ai
 
-# ... (Configuration and LLM prompts remain the same) ...
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s")
 PREP_PREFIX = "prep/"
 OUTPUT_PREFIX = "dashboards/"
 PRICE_CHART_JSON_FOLDER = "price-chart-json/"
-RECOMMENDATION_PREFIX = "recommendations/"
-OPTIONS_ANALYSIS_PREFIX = "options-analysis/contracts/"
-MAX_WORKERS = 8
-
-# --- LLM Prompting Updated for New KPIs ---
-
-_EXAMPLE_JSON_FOR_LLM = """
-{
-  "seo": {
-    "title": "Apple (AAPL) AI-Powered Dashboard: Signals & Charts | ProfitScout",
-    "metaDescription": "Explore the AI-powered dashboard for Apple (AAPL), featuring data-driven signals on trend, momentum, and volatility. Get the latest charts and insights from ProfitScout.",
-    "keywords": ["Apple stock dashboard", "AAPL stock analysis", "AAPL charts", "AAPL momentum", "ProfitScout AAPL"]
-  },
-  "teaser": {
-    "signal": "BULLISH",
-    "summary": "AAPL is demonstrating strong bullish momentum, trading above its 50-day moving average with high volume and neutral RSI, suggesting sustained investor interest.",
-    "metrics": {
-      "Trend Strength": "Above 50D MA",
-      "RSI": "58.4 (Neutral)",
-      "Volume": "+75%"
-    }
-  }
-}
-"""
-
-_PROMPT_TEMPLATE = r"""
-You are an expert financial copywriter and SEO analyst for "ProfitScout". Your task is to generate a JSON object with SEO metadata and a teaser summary for a stock dashboard, based ONLY on the KPI data provided.
-
-### Signal Policy
-Use the `signal` from the `trendStrength` KPI to set the teaser signal. Capitalize it.
-- If `signal` is "bullish" -> "BULLISH"
-- If `signal` is "bearish" -> "BEARISH"
-
-### Instructions
-1.  **SEO Title** (60–70 chars):
-    * Format: "{company_name} ({ticker}) AI-Powered Dashboard: Signals & Charts | ProfitScout"
-
-2.  **SEO Meta Description** (150–160 chars):
-    * Write a compelling summary mentioning the company, ticker, "AI-powered dashboard", "data-driven signals", "trend", "momentum", "volatility", and "ProfitScout".
-
-3.  **SEO Keywords**:
-    * Provide a list of 5 relevant keywords, including "{company_name} stock dashboard", "{ticker} stock analysis", "{ticker} charts", and "ProfitScout {ticker}".
-
-4.  **Teaser Section**:
-    * `signal`: Use the signal from the policy above.
-    * `summary`: A sharp 1–2 sentence outlook that synthesizes the provided KPIs into a cohesive narrative.
-    * `metrics`: A dictionary of **exactly 3** key-value pairs derived from the `kpis` data. Use "Trend Strength", "RSI", and "Volume" as the keys. Format the values concisely (e.g., "58.4 (Neutral)", "+75%").
-
-5.  **Format**:
-    * Output **ONLY** the JSON object that matches the example structure exactly.
-
-### Input Data
-- **Ticker**: {ticker}
-- **Company Name**: {company_name}
-- **Key Performance Indicators (KPIs)**:
-{kpis_str}
-
-### Example Output (Return ONLY this JSON structure)
-{example_json}
-"""
-
-
-def _slug(s: str) -> str:
-    """Creates a safe filename string, consistent with the enrichment service."""
-    return re.sub(r"[^a-zA-Z0-9._-]+", "-", s)[:200]
+MAX_WORKERS = 16 # Increased workers for a simpler, faster I/O bound task
 
 def _delete_old_dashboard_files(ticker: str):
+    """Deletes all previous dashboard JSON files for a given ticker."""
     prefix = f"{OUTPUT_PREFIX}{ticker}_dashboard_"
     blobs_to_delete = gcs.list_blobs(config.GCS_BUCKET_NAME, prefix)
     for blob_name in blobs_to_delete:
@@ -93,62 +26,15 @@ def _delete_old_dashboard_files(ticker: str):
             logging.error(f"[{ticker}] Failed to delete old dashboard file {blob_name}: {e}")
 
 def _get_company_metadata(ticker: str) -> Dict[str, Any]:
+    """Fetches basic company metadata from BigQuery."""
     client = bigquery.Client(project=config.SOURCE_PROJECT_ID)
-    query = f"SELECT company_name, sector, industry FROM `{config.BUNDLER_STOCK_METADATA_TABLE_ID}` WHERE ticker = @ticker ORDER BY quarter_end_date DESC LIMIT 1"
+    query = f"SELECT company_name FROM `{config.BUNDLER_STOCK_METADATA_TABLE_ID}` WHERE ticker = @ticker ORDER BY quarter_end_date DESC LIMIT 1"
     job_config = bigquery.QueryJobConfig(query_parameters=[bigquery.ScalarQueryParameter("ticker", "STRING", ticker)])
     df = client.query(query, job_config=job_config).to_dataframe()
-    if not df.empty:
-        return df.iloc[0].to_dict()
-    return {"company_name": ticker, "sector": None, "industry": None}
-
-def _get_stock_analysis(ticker: str) -> Optional[str]:
-    """Fetches the latest stock-level analysis markdown file."""
-    latest_blob = gcs.get_latest_blob_for_ticker(config.GCS_BUCKET_NAME, RECOMMENDATION_PREFIX, ticker)
-    return latest_blob.download_as_text() if latest_blob else None
-
-def _get_contract_analysis(ticker: str, contract_symbol: str) -> Optional[Dict[str, Any]]:
-    """Fetches the detailed analysis for a single options contract."""
-    blob_name = f"{OPTIONS_ANALYSIS_PREFIX}{_slug(ticker)}/{_slug(contract_symbol)}.json"
-    try:
-        content = gcs.read_blob(config.GCS_BUCKET_NAME, blob_name)
-        return json.loads(content) if content else None
-    except (json.JSONDecodeError, Exception):
-        logging.warning(f"[{ticker}] Could not find or parse analysis for {contract_symbol}")
-        return None
-
-def _get_options_chain_table(ticker: str) -> List[Dict[str, Any]]:
-    """Queries top 10 candidates and enriches them with their specific AI analysis."""
-    client = bigquery.Client(project=config.SOURCE_PROJECT_ID)
-    query = f"""
-        SELECT *
-        FROM `{config.SOURCE_PROJECT_ID}.{config.BIGQUERY_DATASET}.options_candidates`
-        WHERE ticker = @ticker AND selection_run_ts >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
-        ORDER BY options_score DESC, rn
-        LIMIT 10
-    """
-    job_config = bigquery.QueryJobConfig(query_parameters=[bigquery.ScalarQueryParameter("ticker", "STRING", ticker)])
-    df = client.query(query, job_config=job_config).to_dataframe()
-    if df.empty:
-        return []
-
-    # --- THIS IS THE CORRECTED SECTION ---
-    # Convert special date/timestamp columns to string for JSON serialization
-    for col in df.columns:
-        dtype_str = str(df[col].dtype)
-        if 'dbdate' in dtype_str or 'dbtimestamp' in dtype_str or 'datetimetz' in dtype_str:
-            df[col] = df[col].astype(str)
-
-    records = df.to_dict('records')
-    
-    # Enrich each record with its detailed analysis
-    for record in records:
-        contract_symbol = record.get("contract_symbol")
-        if contract_symbol:
-            record['aiAnalysis'] = _get_contract_analysis(ticker, contract_symbol)
-            
-    return records
+    return df.iloc[0].to_dict() if not df.empty else {"company_name": ticker}
 
 def _get_price_chart_data(ticker: str) -> Optional[Dict[str, Any]]:
+    """Fetches the latest price chart JSON file for a ticker."""
     latest_blob = gcs.get_latest_blob_for_ticker(config.GCS_BUCKET_NAME, PRICE_CHART_JSON_FOLDER, ticker)
     if latest_blob:
         try:
@@ -157,100 +43,74 @@ def _get_price_chart_data(ticker: str) -> Optional[Dict[str, Any]]:
             logging.error(f"[{ticker}] Failed to read or parse price chart JSON: {e}")
     return None
 
-def process_ticker(prep_blob_name: str) -> Optional[str]:
+def process_prep_file(prep_blob_name: str) -> Optional[str]:
+    """
+    Processes a single prep file to generate a simple, data-only dashboard JSON.
+    """
     match = re.search(r'prep/([A-Z\.]+)_(\d{4}-\d{2}-\d{2})\.json$', prep_blob_name)
-    if not match: return None
+    if not match:
+        logging.warning(f"Could not parse ticker/date from prep file name: {prep_blob_name}. Skipping.")
+        return None
     
     ticker, run_date_str = match.groups()
-    logging.info(f"[{ticker}] Starting dashboard generation for {run_date_str}...")
-
-    # Initialize all data components with default "empty" values
-    llm_data = {"seo": {}, "teaser": {}}
-    stock_analysis = None
-    price_chart_data = {}
-    enriched_chain_table = []
+    logging.info(f"[{ticker}] Starting dashboard generation from {prep_blob_name}...")
 
     try:
         prep_json_str = gcs.read_blob(config.GCS_BUCKET_NAME, prep_blob_name)
         if not prep_json_str:
-            logging.warning(f"[{ticker}] Prep file was empty. Skipping.")
+            logging.warning(f"[{ticker}] SKIPPING: Prep file is empty.")
             return None
         prep_data = json.loads(prep_json_str)
+
+        if not prep_data.get("kpis"):
+            logging.warning(f"[{ticker}] SKIPPING: Prep file is missing 'kpis' data.")
+            return None
 
         metadata = _get_company_metadata(ticker)
         company_name = metadata.get("company_name", ticker)
         
-        # --- Safely generate LLM content ---
-        try:
-            prompt = _PROMPT_TEMPLATE.format(
-                ticker=ticker,
-                company_name=company_name,
-                kpis_str=json.dumps(prep_data.get("kpis"), indent=2),
-                example_json=_EXAMPLE_JSON_FOR_LLM
-            )
-            llm_response_str = vertex_ai.generate(prompt)
-            if llm_response_str.strip().startswith("```json"):
-                llm_response_str = re.search(r'\{.*\}', llm_response_str, re.DOTALL).group(0)
-            llm_data = json.loads(llm_response_str)
-        except Exception as e:
-            logging.error(f"[{ticker}] Failed to generate or parse LLM content: {e}", exc_info=True)
-            # Use default empty llm_data
-
-        # --- Safely assemble all other data components ---
-        stock_analysis = _get_stock_analysis(ticker)
-        price_chart_data = _get_price_chart_data(ticker)
-        enriched_chain_table = _get_options_chain_table(ticker)
-
-        # --- Always assemble the final dashboard ---
+        # Assemble the final dashboard with only the required data.
         final_dashboard = {
             "ticker": ticker,
             "runDate": run_date_str,
             "titleInfo": {"companyName": company_name, "ticker": ticker, "asOfDate": run_date_str},
             "kpis": prep_data.get("kpis"),
-            "priceChartData": price_chart_data,
-            "stockLevelAnalysis": stock_analysis,
-            "optionsTable": {
-                "title": "Top AI-Curated Options",
-                "chains": enriched_chain_table
-            },
-            "seo": llm_data.get("seo"),
-            "teaser": llm_data.get("teaser"),
+            "priceChartData": _get_price_chart_data(ticker),
         }
         
         _delete_old_dashboard_files(ticker)
         output_blob_name = f"{OUTPUT_PREFIX}{ticker}_dashboard_{run_date_str}.json"
         gcs.write_text(config.GCS_BUCKET_NAME, output_blob_name, json.dumps(final_dashboard, indent=2))
-        logging.info(f"[{ticker}] Successfully generated and uploaded dashboard JSON to {output_blob_name}")
+        logging.info(f"[{ticker}] SUCCESS: Generated and uploaded dashboard JSON.")
         return output_blob_name
 
     except Exception as e:
-        logging.error(f"[{ticker}] A critical error occurred during dashboard generation: {e}", exc_info=True)
-        # In this robust version, we still attempt to write a minimal file if possible,
-        # but for a critical failure like a missing prep file, we will exit.
+        logging.error(f"[{ticker}] CRITICAL ERROR during dashboard generation from {prep_blob_name}: {e}", exc_info=True)
         return None
 
 def run_pipeline():
-    logging.info("--- Starting Dashboard Generation Pipeline (Robust Mode) ---")
+    """
+    Main pipeline to generate a dashboard for every available prep file.
+    """
+    logging.info("--- Starting Dashboard Generation Pipeline (Ultra-Simplified) ---")
     
-    # --- MODIFIED: Process ALL prep files ---
     work_items = gcs.list_blobs(config.GCS_BUCKET_NAME, prefix=PREP_PREFIX)
-    
     if not work_items:
-        logging.info("No prep files found to process. Nothing to do.")
+        logging.warning("No prep files found to process. Exiting.")
         return
 
     logging.info(f"Found {len(work_items)} prep files to process into dashboards.")
     processed_count = 0
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_item = {executor.submit(process_ticker, item): item for item in work_items}
+        future_to_item = {executor.submit(process_prep_file, item): item for item in work_items}
         for future in as_completed(future_to_item):
             try:
                 if future.result():
                     processed_count += 1
             except Exception as exc:
-                logging.error(f"Item {future_to_item[future]} generated an unhandled exception: {exc}", exc_info=True)
+                logging.error(f"Prep file {future_to_item[future]} caused an unhandled exception: {exc}", exc_info=True)
     
-    logging.info(f"--- Dashboard Generation Pipeline Finished. Processed {processed_count} of {len(work_items)} dashboards. ---")
+    logging.info(f"--- Dashboard Generation Pipeline Finished. Successfully generated {processed_count} of {len(work_items)} dashboards. ---")
 
 if __name__ == "__main__":
     run_pipeline()

@@ -6,9 +6,9 @@ from .. import config, gcs
 from ..clients import vertex_ai
 from datetime import date, datetime
 import re
-import json # <-- THIS IS THE FIX
+import json
 
-# --- Updated: New Example reflecting the richer analysis ---
+# --- Example Output ---
 _EXAMPLE_OUTPUT = """
 # Oracle (ORCL) ☁️
 
@@ -29,7 +29,7 @@ Oracle provides comprehensive enterprise IT solutions, including cloud applicati
 Overall: A Strongly Bullish outlook is warranted based on fundamentals, but traders should be aware of the negative short-term price momentum.
 """
 
-# --- Updated: New Prompt accepting the richer signal context ---
+# --- Prompt Template ---
 _PROMPT_TEMPLATE = r"""
 You are a confident but approachable financial analyst writing AI-powered stock recommendations.
 Your tone should be clear, professional, and concise. Your goal is to give users clarity, not noise.
@@ -92,17 +92,22 @@ def _get_signal_and_context(score: float, momentum_pct: float | None) -> tuple[s
 
 def _get_daily_work_list() -> list[dict]:
     """
-    Builds the list of tickers to process.
-    MODIFIED: This version fetches the LATEST score for ALL tickers,
-    not just those from today, to allow for a full rebuild.
+    MODIFIED: Builds the work list from the GCS tickerlist.txt and enriches it
+    with the latest available data from BigQuery for each ticker.
     """
+    logging.info("Fetching work list from GCS and enriching from BigQuery...")
+    tickers = gcs.get_tickers()
+    if not tickers:
+        logging.critical("Ticker list from GCS is empty. No work to do.")
+        return []
+        
     client = bigquery.Client(project=config.SOURCE_PROJECT_ID)
     
-    # --- THIS IS THE "REBUILD ALL" QUERY ---
-    # It finds the most recent score for every ticker, ignoring the date.
+    # This query fetches the latest data for ALL tickers found in the GCS list.
     query = f"""
-        WITH
-        -- Step 1: Get the most recent score for every ticker
+        WITH GCS_Tickers AS (
+            SELECT ticker FROM UNNEST(@tickers) AS ticker
+        ),
         LatestScores AS (
             SELECT
                 ticker,
@@ -122,7 +127,6 @@ def _get_daily_work_list() -> list[dict]:
             )
             WHERE rn = 1
         ),
-        -- Step 2: Get the most recent momentum data for every ticker
         LatestMomentum AS (
             SELECT
                 ticker,
@@ -137,30 +141,39 @@ def _get_daily_work_list() -> list[dict]:
             )
             WHERE rn = 1
         )
-        -- Step 3: Join them together
         SELECT
-            s.ticker,
+            g.ticker,
             s.company_name,
             s.weighted_score,
             s.aggregated_text,
             m.close_30d_delta_pct
-        FROM LatestScores s
-        LEFT JOIN LatestMomentum m ON s.ticker = m.ticker
+        FROM GCS_Tickers g
+        LEFT JOIN LatestScores s ON g.ticker = s.ticker
+        LEFT JOIN LatestMomentum m ON g.ticker = m.ticker
     """
+    
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ArrayQueryParameter("tickers", "STRING", tickers),
+        ]
+    )
 
     try:
-        df = client.query(query).to_dataframe()
+        df = client.query(query, job_config=job_config).to_dataframe()
+        # Filter out tickers that don't have the essential data to proceed
+        df.dropna(subset=['company_name', 'weighted_score', 'aggregated_text'], inplace=True)
         if df.empty:
-            logging.warning("No tickers found in work list. Exiting.")
+            logging.warning("No tickers with sufficient data found after enriching from BigQuery.")
             return []
+        logging.info(f"Successfully created work list for {len(df)} tickers.")
         return df.to_dict('records')
     except Exception as e:
-        logging.critical(f"Failed to build work list: {e}", exc_info=True)
+        logging.critical(f"Failed to build and enrich work list: {e}", exc_info=True)
         return []
 
 
 def _delete_old_recommendation_files(ticker: str):
-    """Deletes all old recommendation files (.md and .json) for a given ticker."""
+    """Deletes all old recommendation files for a given ticker."""
     prefix = f"{config.RECOMMENDATION_PREFIX}{ticker}_recommendation_"
     blobs_to_delete = gcs.list_blobs(config.GCS_BUCKET_NAME, prefix)
     for blob_name in blobs_to_delete:
@@ -181,9 +194,14 @@ def _process_ticker(ticker_data: dict):
     json_blob_path = f"{base_blob_path}.json"
     
     try:
+        # Gracefully handle potentially missing momentum data
+        momentum_pct = ticker_data.get("close_30d_delta_pct")
+        if pd.isna(momentum_pct):
+            momentum_pct = None # Ensure it's None, not NaN, for the next step
+
         outlook_signal, momentum_context = _get_signal_and_context(
             ticker_data["weighted_score"],
-            ticker_data.get("close_30d_delta_pct")
+            momentum_pct
         )
 
         prompt = _PROMPT_TEMPLATE.format(

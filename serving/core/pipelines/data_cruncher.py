@@ -17,17 +17,18 @@ MAX_WORKERS = 16
 # --- Helper Functions ---
 
 def _get_work_list() -> pd.DataFrame:
-    """Queries stock_metadata for the list of tickers to process."""
-    logging.info("Fetching work list from stock_metadata...")
-    client = bigquery.Client(project=config.SOURCE_PROJECT_ID)
-    query = f"""
-        SELECT ticker
-        FROM `{config.BUNDLER_STOCK_METADATA_TABLE_ID}`
-        WHERE ticker IS NOT NULL
-        GROUP BY ticker
     """
-    df = client.query(query).to_dataframe()
-    logging.info(f"Work list created for {len(df)} tickers.")
+    MODIFIED: Fetches the official work list from the tickerlist.txt file in GCS.
+    This is the single source of truth for which tickers to process.
+    """
+    logging.info("Fetching work list from GCS tickerlist.txt...")
+    tickers = gcs.get_tickers()
+    if not tickers:
+        logging.critical("Ticker list from GCS is empty. No work to do.")
+        return pd.DataFrame()
+    
+    df = pd.DataFrame(tickers, columns=["ticker"])
+    logging.info(f"Work list created for {len(df)} tickers from GCS.")
     return df
 
 def _delete_old_prep_files(ticker: str):
@@ -131,13 +132,13 @@ def _fetch_and_calculate_kpis(ticker: str, industry_map: Dict[str, float]) -> Op
         enriched_df = client.query(enriched_query, job_config=job_config).to_dataframe()
 
         if enriched_df.empty:
-            logging.warning(f"[{ticker}] No enriched analysis data found.")
+            logging.warning(f"[{ticker}] No enriched analysis data found. Skipping prep file generation.")
             _delete_old_prep_files(ticker)
             return None
 
         latest_row = enriched_df.iloc[0]
 
-        # --- KPI 1: Trend Strength (No change) ---
+        # --- KPI 1: Trend Strength ---
         price = latest_row.get('adj_close')
         sma50 = latest_row.get('latest_sma50')
         price_date = latest_row.get('date')
@@ -153,7 +154,7 @@ def _fetch_and_calculate_kpis(ticker: str, industry_map: Dict[str, float]) -> Op
                 "tooltip": "Compares the previous day's closing price to the 50-day moving average to identify the current trend."
             }
 
-        # --- KPI 2: RSI Momentum (NEW AND IMPROVED) ---
+        # --- KPI 2: RSI Momentum ---
         latest_rsi = latest_row.get('latest_rsi')
         rsi_delta = latest_row.get('rsi_30d_delta')
         if pd.notna(latest_rsi) and pd.notna(rsi_delta):
@@ -167,7 +168,7 @@ def _fetch_and_calculate_kpis(ticker: str, industry_map: Dict[str, float]) -> Op
                 "tooltip": "Compares the current 14-day RSI to its value 30 days ago to gauge momentum."
             }
 
-        # --- KPI 3: Volume Surge (MODIFIED FOR CLARITY) ---
+        # --- KPI 3: Volume Surge ---
         volume = latest_row.get('volume')
         avg_volume = latest_row.get('avg_volume_30d')
         if pd.notna(volume) and pd.notna(avg_volume) and avg_volume > 0:
@@ -180,7 +181,7 @@ def _fetch_and_calculate_kpis(ticker: str, industry_map: Dict[str, float]) -> Op
                 "tooltip": "The percentage difference between the most recent trading day's volume and its 30-day average volume."
             }
         
-        # --- KPI 4: Historical Volatility (No change) ---
+        # --- KPI 4: Historical Volatility ---
         hv_30 = latest_row.get('hv_30')
         if pd.notna(hv_30):
             final_json["kpis"]["historicalVolatility"] = {
@@ -189,7 +190,7 @@ def _fetch_and_calculate_kpis(ticker: str, industry_map: Dict[str, float]) -> Op
                 "tooltip": "The stock's actual (realized) volatility over the last 30 days."
             }
         
-        # --- KPI 5: 30-Day Price Change (MODIFIED WITH INDUSTRY COMPARISON) ---
+        # --- KPI 5: 30-Day Price Change ---
         change_pct = latest_row.get('close_30d_delta_pct')
         industry = latest_row.get('industry')
         industry_avg = industry_map.get(industry) if industry else None
@@ -227,16 +228,13 @@ def run_pipeline():
 
     work_list_df = _get_work_list()
     if work_list_df.empty:
-        logging.warning("No tickers in work list. Exiting.")
         return
         
-    # --- MODIFIED: Get the industry map once ---
     client = bigquery.Client(project=config.SOURCE_PROJECT_ID)
     industry_performance_map = _get_industry_performance_map(client)
 
     processed_count = 0
     with ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix='CruncherWorker') as executor:
-        # Pass the map to each worker
         future_to_ticker = {
             executor.submit(_fetch_and_calculate_kpis, row['ticker'], industry_performance_map): row['ticker']
             for _, row in work_list_df.iterrows()

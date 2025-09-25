@@ -186,11 +186,16 @@ def process_blob(blob_name: str) -> Optional[str]:
 
     # Fetch KPI JSON and MD from GCS
     kpi_path = f"{PREP_PREFIX}{ticker}_{run_date_str}.json"
-    recommendation_md = gcs.read_text(config.GCS_BUCKET_NAME, blob_name)
+    recommendation_md = gcs.read_blob(config.GCS_BUCKET_NAME, blob_name)
     try:
-        kpis_json = json.loads(gcs.read_text(config.GCS_BUCKET_NAME, kpi_path))
+        kpis_json_str = gcs.read_blob(config.GCS_BUCKET_NAME, kpi_path)
+        if kpis_json_str:
+            kpis_json = json.loads(kpis_json_str)
+        else:
+            logging.warning(f"[{ticker}] KPI JSON file is empty: {kpi_path}")
+            kpis_json = {}
     except Exception as e:
-        logging.error(f"[{ticker}] Failed to fetch KPI JSON: {e}")
+        logging.error(f"[{ticker}] Failed to fetch or parse KPI JSON: {e}")
         kpis_json = {}
 
     # Extract momentum_pct for prompt
@@ -200,7 +205,7 @@ def process_blob(blob_name: str) -> Optional[str]:
         ticker=ticker,
         company_name=company_name,
         year=date.today().year,
-        weighted_score=round(weighted_score, 4),
+        weighted_score=round(weighted_score, 4) if weighted_score is not None else 0.5,
         momentum_pct=momentum_pct if momentum_pct is not None else 'None',
         price=kpis_json.get('kpis', {}).get('trendStrength', {}).get('price', 'N/A'),
         kpis_json=json.dumps(kpis_json, indent=2),
@@ -211,12 +216,15 @@ def process_blob(blob_name: str) -> Optional[str]:
 
     json_blob_path = f"{OUTPUT_PREFIX}{ticker}_page_{run_date_str}.json"
     logging.info(f"[{ticker}] Generating SEO/Teaser/Options JSON for {run_date_str}.")
-
+    
+    llm_response_str = "" # Initialize to handle potential error before assignment
     try:
         llm_response_str = vertex_ai.generate(prompt)
 
         if llm_response_str.strip().startswith("```json"):
-            llm_response_str = re.search(r'\{.*\}', llm_response_str, re.DOTALL).group(0)
+            match = re.search(r'\{.*\}', llm_response_str, re.DOTALL)
+            if match:
+                llm_response_str = match.group(0)
 
         llm_generated_data = json.loads(llm_response_str)
         final_json.update(llm_generated_data)
@@ -249,8 +257,12 @@ def run_pipeline():
         return
 
     logging.info(f"Found {len(work_items)} recommendations to process into pages.")
+    
+    processed_count = 0
     with ThreadPoolExecutor(max_workers=config.MAX_WORKERS_RECOMMENDER) as executor:
-        futures = [executor.submit(process_blob, item) for item in work_items]
-        count = sum(1 for future in as_completed(futures) if future.result())
+        futures = {executor.submit(process_blob, item) for item in work_items}
+        for future in as_completed(futures):
+            if future.result():
+                processed_count += 1
 
-    logging.info(f"--- Page Generation Pipeline Finished. Processed {count} new pages. ---")
+    logging.info(f"--- Page Generation Pipeline Finished. Processed {processed_count} new pages. ---")
