@@ -62,7 +62,9 @@ def _load_bq_df(bq: bigquery.Client, query: str) -> pd.DataFrame:
         for col in df.columns:
             dtype_str = str(df[col].dtype)
             if dtype_str.startswith("datetime64") or "datetimetz" in dtype_str or "dbdate" in dtype_str:
-                df[col] = df[col].astype(str)
+                # Convert to datetime objects, then extract the date part and convert to string.
+                # This ensures a consistent 'YYYY-MM-DD' format and avoids timezone issues.
+                df[col] = pd.to_datetime(df[col], errors='coerce').dt.date.astype(str)
         
         df = df.replace({pd.NA: np.nan})
         df = df.where(pd.notna(df), None)
