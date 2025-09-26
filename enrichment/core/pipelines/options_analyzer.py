@@ -25,7 +25,7 @@ _PROMPT_TEMPLATE = r"""
 You are an expert options analyst. Your task is to analyze a single options contract based on the provided JSON data and produce a quality rating and a summary.
 
 ### Stock Context (Very Important)
-- **`stock_price_trend_signal`**: This is the most important signal. "Bullish" means the stock price is above its 50-day moving average. "Bearish" means it is below.
+- **`stock_price_trend_signal`**: This is the most important signal. "Strongly Bullish" or "Moderately Bullish" means the stock has a positive outlook. "Strongly Bearish" or "Moderately Bearish" means it has a negative outlook.
 - **`rsi`**: A value > 70 is "Overbought" (potential for pullback), < 30 is "Oversold" (potential for bounce).
 - **`close_30d_delta_pct`**: The stock's price performance over the last 30 days.
 
@@ -70,18 +70,30 @@ def _load_df_to_bq(df: pd.DataFrame, table_id: str, project_id: str):
         logging.error(f"Failed to load DataFrame to {table_id}: {e}", exc_info=True)
         raise
 
+def _get_signal_from_score(score: float) -> str:
+    """
+    Determines the 5-tier outlook signal from the weighted_score.
+    """
+    if score >= 0.75:
+        return "Strongly Bullish"
+    elif 0.60 <= score < 0.75:
+        return "Moderately Bullish"
+    elif 0.40 <= score < 0.60:
+        return "Neutral / Mixed"
+    elif 0.25 <= score < 0.40:
+        return "Moderately Bearish"
+    else:  # score < 0.25
+        return "Strongly Bearish"
+
 def _fetch_candidates_all() -> pd.DataFrame:
     """
-    Fetches all candidates that meet the minimum score from the most recent run,
-    and joins them with the LATEST features from options_analysis_input.
+    Fetches all candidates and joins them with the latest analysis_scores
+    to get the weighted_score for a consistent signal.
     """
     client = bigquery.Client(project=config.PROJECT_ID)
     project = config.PROJECT_ID
     dataset = config.BIGQUERY_DATASET
 
-    # --- THIS IS THE FIX ---
-    # The query now finds the MAX timestamp from the candidates table first,
-    # ensuring it always processes the most recent batch of data, regardless of the day.
     query = f"""
     WITH LatestRun AS (
         SELECT MAX(selection_run_ts) AS max_ts
@@ -100,6 +112,15 @@ def _fetch_candidates_all() -> pd.DataFrame:
             FROM `{project}.{dataset}.options_analysis_input`
         )
         WHERE rn = 1
+    ),
+    latest_scores AS (
+        SELECT ticker, weighted_score
+        FROM (
+            SELECT ticker, weighted_score, ROW_NUMBER() OVER(PARTITION BY ticker ORDER BY run_date DESC) as rn
+            FROM `{project}.{dataset}.analysis_scores`
+            WHERE weighted_score IS NOT NULL
+        )
+        WHERE rn = 1
     )
     SELECT
         c.*,
@@ -108,13 +129,10 @@ def _fetch_candidates_all() -> pd.DataFrame:
         a.latest_macd,
         a.latest_sma50,
         a.close_30d_delta_pct,
-        -- Determine the stock trend signal based on price vs. SMA50
-        CASE
-            WHEN a.adj_close > a.latest_sma50 THEN 'Bullish'
-            ELSE 'Bearish'
-        END AS stock_price_trend_signal
+        s.weighted_score
     FROM candidates c
     JOIN latest_analysis a ON c.ticker = a.ticker
+    JOIN latest_scores s ON c.ticker = s.ticker
     ORDER BY c.ticker, c.options_score DESC
     """
     df = client.query(query).to_dataframe()
@@ -122,6 +140,10 @@ def _fetch_candidates_all() -> pd.DataFrame:
     for col in ("selection_run_ts", "expiration_date", "fetch_date"):
         if col in df.columns:
             df[col] = df[col].astype(str)
+
+    if not df.empty:
+        df['outlook_signal'] = df['weighted_score'].apply(_get_signal_from_score)
+
     return df
 
 def _row_to_llm_payload(row: pd.Series) -> str:
@@ -133,7 +155,7 @@ def _row_to_llm_payload(row: pd.Series) -> str:
 
     payload = {
         # Stock Context
-        "stock_price_trend_signal": row.get("stock_price_trend_signal"),
+        "stock_price_trend_signal": row.get("outlook_signal"),
         "rsi": row.get("latest_rsi"),
         "close_30d_delta_pct": row.get("close_30d_delta_pct"),
         # Options Context
@@ -174,7 +196,7 @@ def _process_contract(row: pd.Series):
             "strike_price": row.get("strike"),
             "implied_volatility": row.get("implied_volatility"),
             "iv_signal": row.get("iv_signal"),
-            "stock_price_trend_signal": row.get("stock_price_trend_signal"),
+            "stock_price_trend_signal": row.get("outlook_signal"),
             "setup_quality_signal": quality,
             "summary": obj.get("summary"),
             "contract_symbol": csym,

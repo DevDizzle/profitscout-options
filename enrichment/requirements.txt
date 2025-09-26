@@ -10,3 +10,4 @@ pyarrow
 db-dtypes
 requests
 pandas-ta
+pandas-gbq 

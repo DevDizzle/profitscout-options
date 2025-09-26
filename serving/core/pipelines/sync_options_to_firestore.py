@@ -58,13 +58,11 @@ def _load_bq_df(bq: bigquery.Client, query: str) -> pd.DataFrame:
     """Loads data from a BigQuery query into a pandas DataFrame and cleans it."""
     df = bq.query(query).to_dataframe()
     if not df.empty:
-        # Convert date/time columns to string for Firestore
+        # Convert any remaining date/time columns to string for Firestore
         for col in df.columns:
             dtype_str = str(df[col].dtype)
-            if dtype_str.startswith("datetime64") or "datetimetz" in dtype_str or "dbdate" in dtype_str:
-                # Convert to datetime objects, then extract the date part and convert to string.
-                # This ensures a consistent 'YYYY-MM-DD' format and avoids timezone issues.
-                df[col] = pd.to_datetime(df[col], errors='coerce').dt.date.astype(str)
+            if "datetime" in dtype_str or "dbdate" in dtype_str:
+                df[col] = df[col].astype(str)
         
         df = df.replace({pd.NA: np.nan})
         df = df.where(pd.notna(df), None)
@@ -84,7 +82,8 @@ def run_pipeline(full_reset: bool = False):
     logging.info(f"Full reset? {'YES' if full_reset else 'NO'}")
 
     try:
-        # NEW QUERY: Joins signals with metadata to get the company name
+        # --- THIS IS THE FIX ---
+        # The query now explicitly casts the date fields to STRING to avoid conversion issues.
         signals_query = f"""
             WITH LatestMetadata AS (
                 SELECT 
@@ -94,7 +93,17 @@ def run_pipeline(full_reset: bool = False):
                 FROM `{config.SOURCE_PROJECT_ID}.{config.BIGQUERY_DATASET}.stock_metadata`
             )
             SELECT
-                t1.*,
+                t1.ticker,
+                CAST(t1.run_date AS STRING) AS run_date,
+                CAST(t1.expiration_date AS STRING) AS expiration_date,
+                t1.strike_price,
+                t1.implied_volatility,
+                t1.iv_signal,
+                t1.stock_price_trend_signal,
+                t1.setup_quality_signal,
+                t1.summary,
+                t1.contract_symbol,
+                t1.option_type,
                 t2.company_name
             FROM `{SIGNALS_TABLE_ID}` AS t1
             LEFT JOIN LatestMetadata AS t2 ON t1.ticker = t2.ticker AND t2.rn = 1
