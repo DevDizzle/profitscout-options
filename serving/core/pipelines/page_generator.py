@@ -84,6 +84,13 @@ You are an expert financial copywriter and SEO analyst specializing in AI-powere
 {example_json}
 """
 
+def _clean_aggregated_text(text: str) -> str:
+    """
+    A simple cleaning function to replace escaped double quotes with single quotes.
+    """
+    if not text or not isinstance(text, str):
+        return ""
+    return text.replace('\\"', "'")
 
 def _split_aggregated_text(aggregated_text: str) -> Dict[str, str]:
     """Splits aggregated_text into a dictionary of its component sections."""
@@ -165,7 +172,9 @@ def process_blob(blob_name: str) -> Optional[str]:
         logging.error(f"[{ticker}] Could not find BQ data or company name for {run_date_str}.")
         return None
 
-    aggregated_text = bq_data.get("aggregated_text")
+    # --- THIS IS THE FIX ---
+    # Clean the aggregated_text immediately after fetching it.
+    aggregated_text = _clean_aggregated_text(bq_data.get("aggregated_text"))
     weighted_score = bq_data.get("weighted_score")
     company_name = bq_data.get("company_name")
 
@@ -180,8 +189,6 @@ def process_blob(blob_name: str) -> Optional[str]:
         "fullAnalysis": full_analysis_sections
     }
 
-    # --- THIS IS THE FIX (Part 1) ---
-    # Fetch recommendation metadata to get the definitive signals.
     recommendation_json_path = blob_name.replace('.md', '.json')
     recommendation_md = gcs.read_blob(config.GCS_BUCKET_NAME, blob_name)
     try:
@@ -194,22 +201,14 @@ def process_blob(blob_name: str) -> Optional[str]:
         outlook_signal = "Neutral / Mixed"
         momentum_context = ""
 
-
-    # Fetch KPI JSON
     kpi_path = f"{PREP_PREFIX}{ticker}_{run_date_str}.json"
     try:
         kpis_json_str = gcs.read_blob(config.GCS_BUCKET_NAME, kpi_path)
-        if kpis_json_str:
-            kpis_json = json.loads(kpis_json_str)
-        else:
-            logging.warning(f"[{ticker}] KPI JSON file is empty: {kpi_path}")
-            kpis_json = {}
+        kpis_json = json.loads(kpis_json_str) if kpis_json_str else {}
     except Exception as e:
         logging.error(f"[{ticker}] Failed to fetch or parse KPI JSON: {e}")
         kpis_json = {}
 
-    # --- THIS IS THE FIX (Part 2) ---
-    # Update the prompt to pass the definitive signals.
     prompt = _PROMPT_TEMPLATE.format(
         ticker=ticker,
         company_name=company_name,
@@ -222,11 +221,10 @@ def process_blob(blob_name: str) -> Optional[str]:
         example_json=_EXAMPLE_JSON_FOR_LLM,
     )
 
-
     json_blob_path = f"{OUTPUT_PREFIX}{ticker}_page_{run_date_str}.json"
     logging.info(f"[{ticker}] Generating SEO/Teaser/Options JSON for {run_date_str}.")
     
-    llm_response_str = "" # Initialize to handle potential error before assignment
+    llm_response_str = ""
     try:
         llm_response_str = vertex_ai.generate(prompt)
 
@@ -253,8 +251,7 @@ def process_blob(blob_name: str) -> Optional[str]:
 
 def run_pipeline():
     """
-    Finds all available recommendations and generates a fresh page JSON for each,
-    deleting any old page files in the process.
+    Finds all available recommendations and generates a fresh page JSON for each.
     """
     logging.info("--- Starting Page Generation Pipeline ---")
 
