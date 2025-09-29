@@ -11,43 +11,40 @@ import json
 
 # --- Example Output ---
 _EXAMPLE_OUTPUT = """
-# Oracle (ORCL) ☁️
+# Coty Inc. (COTY) 📉
 
-**Strongly Bullish outlook encountering short-term weakness.**
+**Neutral / Mixed outlook, as the stock's severe technical breakdown and negative news flow are creating significant short-term headwinds.**
 
-**Quick take:** While current price action is weak, Oracle's strong fundamentals, driven by booming AI demand and a massive order backlog, create a compelling long-term picture.
+**Quick take:** Coty is caught between signs of improving operational efficiency and a cascade of negative market data, from analyst downgrades to a deteriorating financial picture.
 
-### Profile
-Oracle provides comprehensive enterprise IT solutions, including cloud applications (OCA) and infrastructure (OCI), serving a wide range of global clients.
+### Key Drivers & Headwinds
+- **Waning Analyst Confidence:** A recent wave of analyst downgrades, including a significant Buy-to-Hold shift from Berenberg, signals that institutional experts are losing faith in the stock's near-term prospects. This consensus shift often precedes further price declines.
+- **Confirmed Technical Breakdown:** The stock is trading firmly below its 50 and 200-day moving averages with a negative MACD. This confirms that sellers are in control and that any rallies are likely to be met with resistance.
+- **Deteriorating Core Financials:** A reported 6% year-over-year revenue decrease for the recent quarter and a forward guidance for a mid-single-digit decline show that the company's core business is currently contracting, not growing.
+- **A Glimmer of Fundamental Strength:** Despite top-line weakness, the company's Return on Equity (ROE) is improving. This is a crucial positive signal that management is making more efficient use of capital, which could form the basis for a future turnaround.
 
-### Key Highlights
-- ⚖️ **Conflicting Signals:** The powerful long-term fundamental story is not yet reflected in the current bearish momentum.
-- 📈 Management reports booming demand for AI infrastructure, with Remaining Performance Obligations (RPO) now at $455B.
-- 📈 Recent quarter revenue grew 12%, driven by strong cloud performance.
-- 🚩 Price is trading below its key 21-day and 50-day moving averages, confirming the short-term downtrend.
-- 🚩 Rising debt (now over $105B) and negative free cash flow are key watch items.
-
-Overall: A Strongly Bullish outlook is warranted based on fundamentals, but traders should be aware of the negative short-term price momentum.
+### The Bottom Line
+While there are underlying fundamental strengths, such as strong brand equity and improving ROE, they are currently eclipsed by the overwhelming weight of negative evidence. The combination of poor technicals, negative sentiment, and declining revenue suggests the path of least resistance is lower in the near term.
 """
 
 # --- Prompt Template ---
 _PROMPT_TEMPLATE = r"""
-You are a confident but approachable financial analyst writing AI-powered stock recommendations.
-Your tone should be clear, professional, and concise. Your goal is to give users clarity, not noise.
+You are an intelligence analyst creating a concise brief for a decision-maker. Your task is to read a dossier of raw intelligence (`Aggregated Analysis Text`) and extract the most critical, data-supported insights. Your goal is to help a reader quickly grasp the most important factors affecting the stock *right now*. Avoid generic statements.
 
-### Analysis Rules (Very Important)
-- **Lead with the Primary Outlook**: The `outlook_signal` is your main thesis (e.g., "Strongly Bullish").
-- **Integrate the Momentum Context**: The `momentum_context` tells you if the short-term price trend agrees or disagrees with the main outlook. You MUST reflect this in your analysis. If they conflict, highlight the tension (e.g., "Strong fundamentals are clashing with weak price action.").
-- **Momentum-First Narrative**: Start your "Quick take" and "Key Highlights" with the momentum story (price trends, chart patterns) before discussing fundamentals (earnings, financials).
+### Analysis Rules (Strict)
+1.  **Identify the Core Conflict**: Read all sections to find the central tension. Is it strong fundamentals vs. weak technicals? A turnaround story? A growth story with valuation concerns? This conflict is your core narrative.
+2.  **Extract Specific, High-Value Data**: Do not just summarize. Pull specific, quantifiable data points (percentages, price levels, analyst names, financial metrics) from the text.
+3.  **Explain the "So What?"**: For every data point you present, you MUST briefly explain its impact or why it matters to an investor.
 
 ### Formatting Rules (Strict)
-- Use this layout and spacing exactly.
 - **H1 line**: `# {{company_name}} ({{ticker}}) [Emoji]`
 - **Bold Outlook Line**: A single bolded line combining the `outlook_signal` and `momentum_context`.
-- **Quick Take**: 1-2 sentences summarizing the overall outlook, leading with the momentum vs. fundamental picture.
-- **Profile & Key Highlights**: Use "### Profile" and "### Key Highlights" headers.
-- **Bullets**: Use Markdown dashes (`- `). Start each bullet with one emoji (📈 bullish, 🚩 bearish, ⚖️ mixed/conflicting). Each bullet must be a concise, data-driven insight from the input text. Cite specific numbers and trends.
-- **Overall**: One sentence that reconciles the momentum view with the fundamental context.
+- **Quick take**: A single sentence that summarizes the core conflict you identified.
+- **Key Drivers & Headwinds**: Use "### Key Drivers & Headwinds". Under this, create 3-5 bullet points. Each bullet point MUST follow this "Theme -> Data -> Impact" structure:
+    - Start with a bolded theme, like `**Waning Analyst Confidence:**`.
+    - Follow with the specific, quantifiable data point from the text.
+    - End with a single sentence explaining the impact of that data (the "so what?").
+- **The Bottom Line**: Use "### The Bottom Line". This is a concluding paragraph synthesizing the drivers and headwinds to provide a final, forward-looking perspective.
 
 ### Input Data
 - **Outlook Signal**: {outlook_signal}
@@ -58,7 +55,6 @@ Your tone should be clear, professional, and concise. Your goal is to give users
 ### Example Output
 {example_output}
 """
-
 def _get_signal_and_context(score: float, momentum_pct: float | None) -> tuple[str, str]:
     """
     Determines the 5-tier outlook signal and the momentum context.
