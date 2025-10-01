@@ -18,7 +18,7 @@ DATASET = "profit_scout"
 PRICE_TABLE_ID = f"{PROJECT}.{DATASET}.price_data"
 TARGET_TABLE_ID = f"{PROJECT}.{DATASET}.options_analysis_input"
 STAGING_TABLE_ID = f"{PROJECT}.{DATASET}._stg_options_analysis"
-METADATA_TABLE_ID = f"{PROJECT}.{DATASET}.stock_metadata" # Added for industry lookup
+METADATA_TABLE_ID = f"{PROJECT}.{DATASET}.stock_metadata"
 
 RSI_LEN, SMA50, SMA200 = 14, 50, 200
 ATM_DTE_MIN, ATM_DTE_MAX, ATM_MNY_PCT = 7, 90, 0.05

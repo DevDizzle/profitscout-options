@@ -4,7 +4,6 @@ import logging
 from core.pipelines import (
     page_generator,
     price_chart_generator,
-    chart_image_generator,
     data_bundler,
     sync_to_firestore,
     data_cruncher, 
@@ -80,12 +79,6 @@ def run_page_generator(request):
 def run_price_chart_generator(request):
     price_chart_generator.run_pipeline()
     return "Price chart generator pipeline finished.", 200
-
-@functions_framework.http
-def run_chart_image_generator(request):
-    """Generates and uploads static chart images."""
-    chart_image_generator.run_pipeline()
-    return "Chart image generator pipeline finished.", 200
 
 @functions_framework.http
 def run_data_bundler(request):

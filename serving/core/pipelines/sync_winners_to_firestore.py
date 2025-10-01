@@ -7,6 +7,8 @@ from google.cloud import firestore, bigquery, storage
 from .. import config
 import numpy as np
 
+bq_client = bigquery.Client(project=config.SOURCE_PROJECT_ID) 
+
 # --------- Tunables ----------
 BATCH_SIZE = 500
 PRIMARY_KEY_FIELD = "ticker"           # Firestore doc id
@@ -155,21 +157,17 @@ def _load_bq_df(bq: bigquery.Client) -> pd.DataFrame:
     return df
 
 
-def run_pipeline(full_reset: bool = False):
+def run_pipeline():
     """
-    Firestore sync with support for a one-time full reset.
-
-    Usage:
-      - First run (wipe & reload): run_pipeline(full_reset=True)
-      - Subsequent runs (zero-downtime): run_pipeline()  # upsert + prune stale
+    Wipes the entire Firestore collection and repopulates it from the
+    BigQuery source table.
     """
     db = firestore.Client(project=config.DESTINATION_PROJECT_ID)
     bq = bigquery.Client(project=config.DESTINATION_PROJECT_ID)
     collection_ref = db.collection(config.FIRESTORE_COLLECTION)
 
-    logging.info("--- Firestore Sync Pipeline ---")
+    logging.info("--- Firestore Sync Pipeline (Full Reset Mode) ---")
     logging.info(f"Target collection: {config.FIRESTORE_COLLECTION}")
-    logging.info(f"Full reset? {'YES' if full_reset else 'NO'}")
 
     try:
         df = _load_bq_df(bq)
@@ -177,57 +175,28 @@ def run_pipeline(full_reset: bool = False):
         logging.critical(f"Failed to query BigQuery: {e}", exc_info=True)
         raise
 
-    if full_reset:
-        _delete_collection_in_batches(collection_ref)
-        if df.empty:
-            logging.info("BigQuery returned 0 rows after reset. Collection remains empty.")
-            return
+    # 1. Always delete the entire collection first
+    _delete_collection_in_batches(collection_ref)
 
-        if PRIMARY_KEY_FIELD not in df.columns:
-            raise ValueError(f"Expected primary key column '{PRIMARY_KEY_FIELD}'")
-
-        upsert_ops = []
-        for _, row in df.iterrows():
-            key = str(row[PRIMARY_KEY_FIELD])
-            doc_ref = collection_ref.document(key)
-            # Convert row to dict here to handle any remaining numpy types
-            upsert_ops.append({"type": "set", "ref": doc_ref, "data": row.to_dict()})
-
-        logging.info(f"Upserting {len(upsert_ops)} documents (post-reset)...")
-        for chunk in _iter_batches(upsert_ops, BATCH_SIZE):
-            _commit_ops(db, chunk)
-
-        logging.info(f"✅ Reset complete. Wrote {len(upsert_ops)} documents.")
+    if df.empty:
+        logging.info("BigQuery returned 0 rows. Collection is now empty.")
         return
 
-    # Incremental mode
-    if df.empty:
-        logging.info("No rows in BigQuery; skipping upserts, only pruning stale documents...")
-        current_keys = set()
-    else:
-        if PRIMARY_KEY_FIELD not in df.columns:
-            raise ValueError(f"Expected primary key column '{PRIMARY_KEY_FIELD}'")
-        upsert_ops = []
-        for _, row in df.iterrows():
-            key = str(row[PRIMARY_KEY_FIELD])
-            doc_ref = collection_ref.document(key)
-            upsert_ops.append({"type": "set", "ref": doc_ref, "data": row.to_dict()})
+    if PRIMARY_KEY_FIELD not in df.columns:
+        raise ValueError(f"Expected primary key column '{PRIMARY_KEY_FIELD}'")
 
-        logging.info(f"Upserting {len(upsert_ops)} documents...")
-        for chunk in _iter_batches(upsert_ops, BATCH_SIZE):
-            _commit_ops(db, chunk)
-        current_keys = set(str(x) for x in df[PRIMARY_KEY_FIELD].tolist())
+    # 2. Prepare all documents for insertion
+    upsert_ops = []
+    for _, row in df.iterrows():
+        key = str(row[PRIMARY_KEY_FIELD])
+        doc_ref = collection_ref.document(key)
+        # Convert row to dict here to handle any remaining numpy types
+        upsert_ops.append({"type": "set", "ref": doc_ref, "data": row.to_dict()})
 
-    logging.info("Scanning Firestore for stale docs...")
-    existing_keys = [doc.id for doc in collection_ref.stream()]
-    to_delete = [k for k in existing_keys if k not in current_keys]
+    # 3. Commit the new documents in batches
+    logging.info(f"Populating collection with {len(upsert_ops)} documents...")
+    for chunk in _iter_batches(upsert_ops, BATCH_SIZE):
+        _commit_ops(db, chunk)
 
-    if to_delete:
-        logging.info(f"Deleting {len(to_delete)} stale documents...")
-        delete_ops = [{"type": "delete", "ref": collection_ref.document(k)} for k in to_delete]
-        for chunk in _iter_batches(delete_ops, BATCH_SIZE):
-            _commit_ops(db, chunk)
-    else:
-        logging.info("No stale documents to delete.")
-
-    logging.info(f"✅ Incremental sync complete. Upserted {len(current_keys)}; removed {len(to_delete)}.")
+    logging.info(f"✅ Sync complete. Wrote {len(upsert_ops)} documents.")
+    return

@@ -15,51 +15,53 @@ MAX_WORKERS = 16
 OUTPUT_TABLE_ID = f"{config.PROJECT_ID}.{config.BIGQUERY_DATASET}.options_analysis_signals"
 
 
-# --- Final, Data-Rich LLM Prompting ---
+# --- New LLM Prompting ---
 _EXAMPLE_OUTPUT = """{
   "setup_quality": "Strong",
-  "summary": "The stock's powerful bullish trend, confirmed by its price being over 10% above the 50D SMA and a positive 90-day performance of 22%, aligns perfectly with this call option. The reasonable implied volatility of 31% and high open interest of over 3,500 contracts suggest a well-priced and liquid entry."
+  "summary": "The contract's low implied volatility and high liquidity create a favorable risk/reward profile that aligns well with the stock's bullish technical momentum."
 }"""
 
 _PROMPT_TEMPLATE = r"""
-You are an expert options analyst with access to a comprehensive data payload for a single options contract. Your task is to synthesize this data to produce a professional quality rating and summary.
+You are an expert options analyst. Your task is to analyze a single options contract based on the provided JSON data and produce a quality rating and a summary.
 
-### Analysis Framework:
-1.  **Primary Thesis (Trend Alignment)**: Your entire analysis MUST be framed by the `trend_signal`.
-    - A "Bullish" signal strongly favors CALL options. A "Bearish" signal strongly favors PUT options.
-    - This alignment is the single most important factor. A misalignment (e.g., Bullish trend for a PUT) should almost always result in a "Weak" rating.
+### Stock Context (Very Important)
+- **`stock_price_trend_signal`**: This is the most important signal. "Strongly Bullish" or "Moderately Bullish" means the stock has a positive outlook. "Strongly Bearish" or "Moderately Bearish" means it has a negative outlook.
+- **`rsi`**: A value > 70 is "Overbought" (potential for pullback), < 30 is "Oversold" (potential for bounce).
+- **`close_30d_delta_pct`**: The stock's price performance over the last 30 days.
 
-2.  **Secondary Thesis (Momentum & Conviction)**: Use the numerical momentum indicators to gauge the strength of the primary trend.
-    - `close_30d_delta_pct`: Is this strongly positive or negative?
-    - `rsi`: Is the RSI confirming the trend or is it in an extreme (overbought/oversold) state that might suggest a pause?
-
-3.  **Valuation & Risk (Volatility & Greeks)**: Assess if the option is fairly priced and what risks are present.
-    - `implied_volatility_pct`: Is this high or low? Compare it to the `historical_volatility_30d_pct`. A lower IV is generally better for buyers.
-    - `theta`: How much value will the option lose per day? This is especially important for low `dte` contracts.
-
-4.  **Execution Feasibility (Liquidity)**: Determine if the option can be traded easily.
-    - `liquidity_signal`: A "Poor" signal, driven by a high `spread_pct` or low `open_interest`, is a major red flag and should downgrade the quality.
+### Analysis Guidelines:
+- **Directional Alignment**: The primary thesis comes from the stock's trend. A "Bullish" `stock_price_trend_signal` favors CALL options. A "Bearish" signal favors PUT options.
+- **Contradictions**: If a CALL option is presented but the stock trend is "Bearish", you must downgrade the quality (likely "Weak"). The same applies to a PUT option with a "Bullish" stock trend.
+- **Volatility (`iv_signal`)**: A "low" `iv_signal` is favorable for buying options (cheaper premium). A "high" signal is unfavorable (expensive premium).
+- **Liquidity**: High `open_interest` and `volume` are good. A `spread_pct` greater than 10% is a sign of poor liquidity and is a negative factor.
+- **Greeks**: A `delta` between 0.35 and 0.60 is often ideal.
 
 ### Output Instructions:
-- Your response MUST be a JSON object with `setup_quality` and `summary`.
-- `setup_quality`: Your final rating: "Strong", "Fair", or "Weak".
-- `summary`: A single, dense sentence that justifies your rating, citing at least three specific data points (e.g., "30-day momentum," "implied volatility," "open interest") from the input to support your conclusion.
+- Your response MUST be a JSON object with exactly two keys: `setup_quality` and `summary`.
+- `setup_quality`: Your rating of the trade setup. Must be one of "Strong", "Fair", or "Weak".
+- `summary`: A single-sentence justification for your rating, framed as an observation of market conditions.
 
 ### Example Output (for format only):
 {example_output}
 
-### Comprehensive data for the contract:
+### Provided data for the contract:
 {contract_data}
 """
 
 
 def _load_df_to_bq(df: pd.DataFrame, table_id: str, project_id: str):
-    """Truncates and loads a pandas DataFrame into a BigQuery table."""
+    """
+    Truncates and loads a pandas DataFrame into a BigQuery table.
+    """
     if df.empty:
         logging.warning("DataFrame is empty. Skipping BigQuery load.")
         return
+
     client = bigquery.Client(project=project_id)
-    job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
+    job_config = bigquery.LoadJobConfig(
+        write_disposition="WRITE_TRUNCATE",
+    )
+
     try:
         job = client.load_table_from_dataframe(df, table_id, job_config=job_config)
         job.result()
@@ -68,12 +70,30 @@ def _load_df_to_bq(df: pd.DataFrame, table_id: str, project_id: str):
         logging.error(f"Failed to load DataFrame to {table_id}: {e}", exc_info=True)
         raise
 
+def _get_signal_from_score(score: float) -> str:
+    """
+    Determines the 5-tier outlook signal from the weighted_score.
+    """
+    if score >= 0.75:
+        return "Strongly Bullish"
+    elif 0.60 <= score < 0.75:
+        return "Moderately Bullish"
+    elif 0.40 <= score < 0.60:
+        return "Neutral / Mixed"
+    elif 0.25 <= score < 0.40:
+        return "Moderately Bearish"
+    else:  # score < 0.25
+        return "Strongly Bearish"
 
 def _fetch_candidates_all() -> pd.DataFrame:
-    """Fetches all candidates and enriches them with a comprehensive feature set."""
+    """
+    Fetches all candidates and joins them with the latest analysis_scores
+    to get the weighted_score for a consistent signal.
+    """
     client = bigquery.Client(project=config.PROJECT_ID)
     project = config.PROJECT_ID
     dataset = config.BIGQUERY_DATASET
+
     query = f"""
     WITH LatestRun AS (
         SELECT MAX(selection_run_ts) AS max_ts
@@ -92,95 +112,94 @@ def _fetch_candidates_all() -> pd.DataFrame:
             FROM `{project}.{dataset}.options_analysis_input`
         )
         WHERE rn = 1
+    ),
+    latest_scores AS (
+        SELECT ticker, weighted_score
+        FROM (
+            SELECT ticker, weighted_score, ROW_NUMBER() OVER(PARTITION BY ticker ORDER BY run_date DESC) as rn
+            FROM `{project}.{dataset}.analysis_scores`
+            WHERE weighted_score IS NOT NULL
+        )
+        WHERE rn = 1
     )
     SELECT
-        -- From Candidates (10 fields)
-        c.contract_symbol, c.option_type, c.expiration_date, c.strike, c.bid, c.ask,
-        c.volume, c.open_interest, c.implied_volatility, c.delta, c.theta,
-        c.fetch_date, c.ticker,
-
-        -- From Analysis Input (5+ fields)
-        a.adj_close, a.latest_sma50, a.latest_sma200, a.latest_rsi,
-        a.close_30d_delta_pct, a.hv_30 as historical_volatility_30d, a.iv_signal
-
+        c.*,
+        a.iv_signal,
+        a.latest_rsi,
+        a.latest_macd,
+        a.latest_sma50,
+        a.close_30d_delta_pct,
+        s.weighted_score
     FROM candidates c
     JOIN latest_analysis a ON c.ticker = a.ticker
+    JOIN latest_scores s ON c.ticker = s.ticker
     ORDER BY c.ticker, c.options_score DESC
     """
     df = client.query(query).to_dataframe()
-    for col in ("expiration_date", "fetch_date"):
+    # Stringify dates for JSON safety in the prompt
+    for col in ("selection_run_ts", "expiration_date", "fetch_date"):
         if col in df.columns:
             df[col] = df[col].astype(str)
+
+    if not df.empty:
+        df['outlook_signal'] = df['weighted_score'].apply(_get_signal_from_score)
+
     return df
 
-
 def _row_to_llm_payload(row: pd.Series) -> str:
-    """Builds the final hybrid payload of signals and numerical values."""
-    # --- Liquidity Calculations ---
+    """Builds the single-contract JSON payload for the LLM."""
     bid = row.get("bid", 0)
     ask = row.get("ask", 0)
-    mid_px = (bid + ask) / 2.0 if bid > 0 and ask > 0 else 0
-    spread_pct = round(((ask - bid) / mid_px) * 100, 2) if mid_px > 0 else 100.0
+    mid_px = (bid + ask) / 2.0 if bid > 0 and ask > 0 else row.get("last_price", 0)
+    spread_pct = ((ask - bid) / mid_px) * 100 if mid_px > 0 else None
 
-    # --- Signal Generation ---
-    liquidity_signal = "Good"
-    if row.get("open_interest", 0) < 500 or spread_pct > 20:
-        liquidity_signal = "Poor"
-    elif row.get("open_interest", 0) < 1000 or spread_pct > 15:
-        liquidity_signal = "Fair"
-
-    trend_signal = "Neutral"
-    if pd.notna(row.get("adj_close")) and pd.notna(row.get("latest_sma50")):
-        if row["adj_close"] > row["latest_sma50"]:
-            trend_signal = "Bullish"
-        else:
-            trend_signal = "Bearish"
-
-    rsi_signal = "Neutral"
-    if pd.notna(row.get("latest_rsi")):
-        if row["latest_rsi"] > 70:
-            rsi_signal = "Overbought"
-        elif row["latest_rsi"] < 30:
-            rsi_signal = "Oversold"
-
-    # --- Final Payload Assembly ---
     payload = {
-        # --- High-Level Signals ---
-        "trend_signal": trend_signal,
-        "rsi_signal": rsi_signal,
+        # Stock Context
+        "stock_price_trend_signal": row.get("outlook_signal"),
+        "rsi": row.get("latest_rsi"),
+        "close_30d_delta_pct": row.get("close_30d_delta_pct"),
+        # Options Context
+        "option_type": str(row["option_type"]).lower(),
         "iv_signal": row.get("iv_signal"),
-        "liquidity_signal": liquidity_signal,
-
-        # --- Key Numerical Values ---
-        "underlying_price": round(row.get("adj_close", 0), 2),
-        "strike_price": round(row.get("strike", 0), 2),
-        "dte": (pd.to_datetime(row["expiration_date"]).date() - pd.to_datetime(row["fetch_date"]).date()).days,
-        "close_30d_delta_pct": round(row.get("close_30d_delta_pct", 0), 2),
-        "implied_volatility_pct": round(row.get("implied_volatility", 0) * 100, 2),
-        "historical_volatility_30d_pct": round(row.get("historical_volatility_30d", 0) * 100, 2),
-        "delta": round(row.get("delta", 0), 3),
-        "theta": round(row.get("theta", 0), 3),
+        "delta": row.get("delta"),
         "open_interest": row.get("open_interest"),
+        "volume": row.get("volume"),
+        "spread_pct": spread_pct,
     }
-    return json.dumps({k: v for k, v in payload.items() if pd.notna(v)}, indent=2)
+    # Remove keys with None/NaN values before sending to LLM
+    clean_payload = {k: v for k, v in payload.items() if pd.notna(v)}
+    return json.dumps(clean_payload, indent=2)
 
 
 def _process_contract(row: pd.Series):
-    """Processes a single contract row using the final payload."""
+    """Processes a single contract row and returns a dictionary for the BQ table."""
     ticker = row["ticker"]
     csym = row.get("contract_symbol")
+
     prompt = _PROMPT_TEMPLATE.format(
         example_output=_EXAMPLE_OUTPUT,
         contract_data=_row_to_llm_payload(row),
     )
+
     try:
         resp = vertex_ai.generate(prompt)
+        
+        # --- FIX: Robustly handle and parse the AI response ---
+        if not resp or "{" not in resp:
+             raise ValueError("Received an empty or invalid response from the AI model.")
+
         if resp.strip().startswith("```json"):
-            resp = re.search(r'\{.*\}', resp, re.DOTALL).group(0)
+            match = re.search(r'\{.*\}', resp, re.DOTALL)
+            if not match:
+                raise ValueError("Could not extract JSON from code block response.")
+            resp = match.group(0)
+            
         obj = json.loads(resp)
+
         quality = obj.get("setup_quality")
         if quality not in ("Strong", "Fair", "Weak"):
             raise ValueError(f"Invalid 'setup_quality' received: {quality}")
+
         return {
             "ticker": ticker,
             "run_date": row.get("fetch_date"),
@@ -188,7 +207,7 @@ def _process_contract(row: pd.Series):
             "strike_price": row.get("strike"),
             "implied_volatility": row.get("implied_volatility"),
             "iv_signal": row.get("iv_signal"),
-            "stock_price_trend_signal": trend_signal, # Pass the calculated trend signal
+            "stock_price_trend_signal": row.get("outlook_signal"),
             "setup_quality_signal": quality,
             "summary": obj.get("summary"),
             "contract_symbol": csym,
@@ -198,14 +217,16 @@ def _process_contract(row: pd.Series):
         logging.error(f"[{ticker}] Contract {csym} failed: {e}", exc_info=True)
         return None
 
-
 def run_pipeline():
-    """Runs the contract-level decisioning pipeline."""
+    """
+    Runs the contract-level decisioning pipeline and loads results to BigQuery.
+    """
     logging.info("--- Starting Options Analysis Signal Generation ---")
     df = _fetch_candidates_all()
     if df.empty:
         logging.warning("No candidate contracts found. Exiting.")
         return
+
     results = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futures = {ex.submit(_process_contract, row): row.get("contract_symbol") for _, row in df.iterrows()}
@@ -216,10 +237,14 @@ def run_pipeline():
                     results.append(result)
             except Exception as e:
                 logging.error(f"Future for {futures[fut]} failed: {e}", exc_info=True)
+
+
     if not results:
         logging.warning("No results were generated after processing. Exiting.")
         return
+
     output_df = pd.DataFrame(results)
     logging.info(f"Generated {len(output_df)} signals. Loading to BigQuery...")
     _load_df_to_bq(output_df, OUTPUT_TABLE_ID, config.PROJECT_ID)
+
     logging.info(f"--- Finished. Wrote {len(output_df)} signals to {OUTPUT_TABLE_ID}. ---")
