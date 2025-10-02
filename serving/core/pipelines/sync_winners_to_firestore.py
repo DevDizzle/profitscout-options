@@ -1,24 +1,20 @@
-# serving/core/pipelines/sync_to_firestore.py
 import logging
-import re
-from urllib.parse import urlparse
 import pandas as pd
-from google.cloud import firestore, bigquery, storage
+from google.cloud import firestore, bigquery
 from .. import config
 import numpy as np
 
-bq_client = bigquery.Client(project=config.SOURCE_PROJECT_ID) 
-
-# --------- Tunables ----------
+# --- Configuration ---
 BATCH_SIZE = 500
-PRIMARY_KEY_FIELD = "ticker"           # Firestore doc id
-URI_FIELDS = ["uri", "image_uri", "pdf_uri"]  # Columns to validate (if using GCS)
-VALIDATE_GCS_LINKS = False             # Set True to check GCS object existence
-# ------------------------------
+PRIMARY_KEY_FIELD = "ticker"
+# The BigQuery table to sync from
+SOURCE_TABLE_ID = "profitscout-lx6bb.profit_scout.winners_dashboard"
+# The Firestore collection to sync to
+FIRESTORE_COLLECTION_NAME = "winners_dashboard"
 
-_GCS_URI_RE = re.compile(r"^gs://([^/]+)/(.+)$")
 
 def _iter_batches(iterable, n):
+    """Yield successive n-sized chunks from iterable."""
     batch = []
     for item in iterable:
         batch.append(item)
@@ -28,66 +24,8 @@ def _iter_batches(iterable, n):
     if batch:
         yield batch
 
-def _is_gcs_uri(s: str) -> bool:
-    if not s or not isinstance(s, str):
-        return False
-    if s.startswith("gs://"):
-        return True
-    try:
-        u = urlparse(s)
-        return ("storage.googleapis.com" in (u.netloc or "")) and len(u.path.split("/")) >= 3
-    except Exception:
-        return False
-
-def _gcs_blob_from_any(storage_client: storage.Client, uri: str):
-    if uri.startswith("gs://"):
-        m = _GCS_URI_RE.match(uri)
-        if not m:
-            return None
-        bucket_name, blob_name = m.group(1), m.group(2)
-    else:
-        u = urlparse(uri)
-        parts = [p for p in (u.path or "").split("/") if p]
-        if len(parts) < 2:
-            return None
-        bucket_name = parts[0]
-        blob_name = "/".join(parts[1:])
-    bucket = storage_client.bucket(bucket_name)
-    return bucket_name, blob_name, bucket.blob(blob_name)
-
-def _validate_gcs_links(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty or not VALIDATE_GCS_LINKS:
-        return df
-    present_uri_cols = [c for c in URI_FIELDS if c in df.columns]
-    if not present_uri_cols:
-        return df
-
-    storage_client = storage.Client(project=config.DESTINATION_PROJECT_ID)
-
-    def row_available(row) -> bool:
-        try:
-            found_any = False
-            for col in present_uri_cols:
-                val = row.get(col)
-                if not val:
-                    return False
-                if _is_gcs_uri(val):
-                    found_any = True
-                    tup = _gcs_blob_from_any(storage_client, val)
-                    if not tup:
-                        return False
-                    _, _, blob = tup
-                    if not blob.exists():
-                        return False
-            return True if found_any else True
-        except Exception:
-            return False
-
-    df = df.copy()
-    df["is_available"] = df.apply(row_available, axis=1)
-    return df
-
 def _commit_ops(db, ops):
+    """Commits a list of Firestore operations in batches."""
     batch = db.batch()
     count = 0
     for op in ops:
@@ -104,99 +42,74 @@ def _commit_ops(db, ops):
         batch.commit()
 
 def _delete_collection_in_batches(collection_ref):
+    """Wipes all documents from a Firestore collection."""
     logging.info(f"Wiping Firestore collection: '{collection_ref.id}'...")
+    deleted_count = 0
     while True:
         docs = list(collection_ref.limit(BATCH_SIZE).stream())
         if not docs:
             break
         ops = [{"type": "delete", "ref": d.reference} for d in docs]
         _commit_ops(firestore.Client(project=config.DESTINATION_PROJECT_ID), ops)
-        logging.info(f"Deleted {len(ops)} docs...")
-    logging.info("Wipe complete.")
+        deleted_count += len(ops)
+        logging.info(f"Deleted {deleted_count} total docs...")
+    logging.info(f"Wipe complete for collection '{collection_ref.id}'.")
 
-def _load_bq_df(bq: bigquery.Client) -> pd.DataFrame:
-    """
-    Loads data from BigQuery and cleans it for Firestore.
-    """
-    query = f"""
-      SELECT *
-      FROM `{config.SYNC_FIRESTORE_TABLE_ID}`
-      WHERE weighted_score IS NOT NULL
-    """
+def _load_bq_df(bq: bigquery.Client, query: str) -> pd.DataFrame:
+    """Loads data from a BigQuery query into a pandas DataFrame and cleans it."""
     df = bq.query(query).to_dataframe()
-
     if not df.empty:
-        logging.info("--- Raw DataFrame from BigQuery ---")
-        # Use an in-memory string stream to capture the output of df.info()
-        from io import StringIO
-        buffer = StringIO()
-        df.info(buf=buffer)
-        logging.info(buffer.getvalue())
-        logging.info(df.head())
-
-        # Convert date-like columns to strings
+        # Convert date/time columns to string for Firestore compatibility
         for col in df.columns:
             dtype_str = str(df[col].dtype)
-            if dtype_str.startswith("datetime64") or "datetimetz" in dtype_str or dtype_str == "dbdate":
+            if "datetime" in dtype_str or "dbdate" in dtype_str or "date" in dtype_str:
                 df[col] = df[col].astype(str)
-
-        # Explicitly handle numeric types, coercing errors to NaN
-        for col in ['weighted_score', 'price', 'thirty_day_change_pct']:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-
-        # Convert all pandas NA types and numpy NaN to None for Firestore
+        
+        # Replace pandas/numpy nulls with None for Firestore
         df = df.replace({pd.NA: np.nan}).where(pd.notna(df), None)
-
-        logging.info("--- Cleaned DataFrame for Firestore ---")
-        buffer = StringIO()
-        df.info(buf=buffer)
-        logging.info(buffer.getvalue())
-        logging.info(df.head())
-
     return df
 
-
-def run_pipeline():
+def run_pipeline(full_reset: bool = True):
     """
-    Wipes the entire Firestore collection and repopulates it from the
-    BigQuery source table.
+    Wipes and repopulates the 'winners_dashboard' collection in Firestore
+    from the corresponding BigQuery table.
     """
     db = firestore.Client(project=config.DESTINATION_PROJECT_ID)
-    bq = bigquery.Client(project=config.DESTINATION_PROJECT_ID)
-    collection_ref = db.collection(config.FIRESTORE_COLLECTION)
+    bq = bigquery.Client(project=config.SOURCE_PROJECT_ID)
+    
+    collection_ref = db.collection(FIRESTORE_COLLECTION_NAME)
+    logging.info(f"--- Winners Dashboard Sync Pipeline ---")
+    logging.info(f"Target collection: {collection_ref.id}")
+    logging.info(f"Source table: {SOURCE_TABLE_ID}")
 
-    logging.info("--- Firestore Sync Pipeline (Full Reset Mode) ---")
-    logging.info(f"Target collection: {config.FIRESTORE_COLLECTION}")
+    if full_reset:
+        _delete_collection_in_batches(collection_ref)
 
     try:
-        df = _load_bq_df(bq)
+        # Simple query to select all data from the source table
+        query = f"SELECT * FROM `{SOURCE_TABLE_ID}`"
+        df = _load_bq_df(bq, query)
     except Exception as e:
         logging.critical(f"Failed to query BigQuery: {e}", exc_info=True)
         raise
 
-    # 1. Always delete the entire collection first
-    _delete_collection_in_batches(collection_ref)
-
     if df.empty:
-        logging.info("BigQuery returned 0 rows. Collection is now empty.")
+        logging.warning("Source table is empty. Collection will remain empty.")
         return
 
     if PRIMARY_KEY_FIELD not in df.columns:
-        raise ValueError(f"Expected primary key column '{PRIMARY_KEY_FIELD}'")
+        raise ValueError(f"Primary key '{PRIMARY_KEY_FIELD}' not found in the table.")
 
-    # 2. Prepare all documents for insertion
+    # Prepare documents for Firestore
     upsert_ops = []
     for _, row in df.iterrows():
         key = str(row[PRIMARY_KEY_FIELD])
         doc_ref = collection_ref.document(key)
-        # Convert row to dict here to handle any remaining numpy types
         upsert_ops.append({"type": "set", "ref": doc_ref, "data": row.to_dict()})
-
-    # 3. Commit the new documents in batches
-    logging.info(f"Populating collection with {len(upsert_ops)} documents...")
+    
+    logging.info(f"Populating '{collection_ref.id}' with {len(upsert_ops)} documents...")
     for chunk in _iter_batches(upsert_ops, BATCH_SIZE):
         _commit_ops(db, chunk)
-
-    logging.info(f"✅ Sync complete. Wrote {len(upsert_ops)} documents.")
-    return
+    
+    logging.info(f"✅ Sync complete for '{collection_ref.id}'.")
+    logging.info("--- Winners Dashboard Sync Pipeline Finished ---")

@@ -6,85 +6,126 @@ from google.cloud import bigquery
 from .. import config, bq
 
 # --- Configuration ---
-WINNERS_TABLE_ID = f"{config.DESTINATION_PROJECT_ID}.{config.BIGQUERY_DATASET}.winners_dashboard"
 SIGNALS_TABLE_ID = f"{config.SOURCE_PROJECT_ID}.{config.BIGQUERY_DATASET}.options_analysis_signals"
 OPTIONS_CHAIN_TABLE_ID = f"{config.SOURCE_PROJECT_ID}.{config.BIGQUERY_DATASET}.options_chain"
-PRICE_DATA_TABLE_ID = f"{config.SOURCE_PROJECT_ID}.{config.BIGQUERY_DATASET}.price_data"
-OUTPUT_TABLE_ID = f"{config.DESTINATION_PROJECT_ID}.{config.BIGQUERY_DATASET}.performance_tracker"
+TRACKER_TABLE_ID = f"{config.SOURCE_PROJECT_ID}.{config.BIGQUERY_DATASET}.performance_tracker"
 
-# --- Main Logic ---
-
-def _get_new_and_active_winners(bq_client: bigquery.Client) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _get_new_and_active_contracts(bq_client: bigquery.Client) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Identifies today's new winners and fetches the list of previously identified, still-active winners.
+    1. Fetches today's new "Strong" signals that are not already in the tracker.
+    2. Fetches all contracts currently marked as 'Active' in the tracker.
     """
     today_iso = date.today().isoformat()
-    
-    # Query to find today's new winners that are not already being tracked as 'Active'
-    new_winners_query = f"""
+
+    # --- THIS IS THE FIX ---
+    # The query now explicitly casts the `run_date` field to a DATE before comparing.
+    new_signals_query = f"""
         SELECT
-            w.ticker,
             s.contract_symbol,
+            s.ticker,
+            CAST(s.run_date AS DATE) as run_date,
+            CAST(s.expiration_date AS DATE) as expiration_date,
             s.option_type,
-            s.expiration_date,
             s.strike_price,
-            p.adj_close AS stock_price_initial,
-            (s.bid + s.ask) / 2 AS initial_price
-        FROM `{WINNERS_TABLE_ID}` w
-        JOIN `{SIGNALS_TABLE_ID}` s ON w.ticker = s.ticker
-        LEFT JOIN `{PRICE_DATA_TABLE_ID}` p ON w.ticker = p.ticker AND p.date = s.run_date
-        LEFT JOIN `{OUTPUT_TABLE_ID}` t ON s.contract_symbol = t.contract_symbol AND t.status = 'Active'
-        WHERE w.run_date = @today
-          AND s.run_date = @today
-          AND s.setup_quality_signal LIKE '🟢 Strong'
-          AND t.contract_symbol IS NULL -- This ensures we only get contracts not already tracked
+            s.stock_price_trend_signal,
+            s.setup_quality_signal
+        FROM `{SIGNALS_TABLE_ID}` s
+        LEFT JOIN `{TRACKER_TABLE_ID}` t ON s.contract_symbol = t.contract_symbol
+        WHERE CAST(s.run_date AS DATE) = @today
+          AND s.setup_quality_signal = 'Strong'
+          AND (
+            (s.stock_price_trend_signal LIKE '%Bullish%' AND s.option_type = 'call') OR
+            (s.stock_price_trend_signal LIKE '%Bearish%' AND s.option_type = 'put')
+          )
+          AND t.contract_symbol IS NULL
     """
-    
-    # Query to get the list of contracts that are already being tracked and are 'Active'
-    active_winners_query = f"""
-        SELECT DISTINCT
+
+    active_contracts_query = f"""
+        SELECT
             contract_symbol,
-            ticker,
-            recommendation_date,
-            initial_price,
-            stock_price_initial
-        FROM `{OUTPUT_TABLE_ID}`
+            run_date,
+            expiration_date,
+            initial_price
+        FROM `{TRACKER_TABLE_ID}`
         WHERE status = 'Active'
     """
 
     job_config = bigquery.QueryJobConfig(query_parameters=[bigquery.ScalarQueryParameter("today", "DATE", today_iso)])
-    
-    new_winners_df = bq_client.query(new_winners_query, job_config=job_config).to_dataframe()
-    active_winners_df = bq_client.query(active_winners_query).to_dataframe()
-    
-    return new_winners_df, active_winners_df
+    new_signals_df = bq_client.query(new_signals_query, job_config=job_config).to_dataframe()
+    active_contracts_df = bq_client.query(active_contracts_query).to_dataframe()
+
+    return new_signals_df, active_contracts_df
 
 def _get_current_prices(bq_client: bigquery.Client, contracts_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Fetches the latest stock and option prices for a given list of contracts.
+    Fetches the latest mid-price for a given list of contract symbols.
     """
     if contracts_df.empty:
         return pd.DataFrame()
-        
-    contract_symbols = contracts_df['contract_symbol'].tolist()
-    
+
+    contract_symbols = contracts_df['contract_symbol'].unique().tolist()
+
     query = f"""
         SELECT
-            c.contract_symbol,
-            p.adj_close AS stock_price_snapshot,
-            (c.bid + c.ask) / 2 AS snapshot_price
-        FROM `{OPTIONS_CHAIN_TABLE_ID}` c
-        LEFT JOIN `{PRICE_DATA_TABLE_ID}` p ON c.ticker = p.ticker AND c.fetch_date = p.date
-        WHERE c.contract_symbol IN UNNEST(@contract_symbols)
-          AND c.fetch_date = (SELECT MAX(fetch_date) FROM `{OPTIONS_CHAIN_TABLE_ID}`)
+            contract_symbol,
+            (bid + ask) / 2 AS current_price
+        FROM `{OPTIONS_CHAIN_TABLE_ID}`
+        WHERE contract_symbol IN UNNEST(@contract_symbols)
+          AND fetch_date = (SELECT MAX(fetch_date) FROM `{OPTIONS_CHAIN_TABLE_ID}`)
+          AND bid > 0 AND ask > 0
     """
-    
+
     job_config = bigquery.QueryJobConfig(
         query_parameters=[bigquery.ArrayQueryParameter("contract_symbols", "STRING", contract_symbols)]
     )
-    
     prices_df = bq_client.query(query, job_config=job_config).to_dataframe()
     return prices_df
+
+def _upsert_with_merge(bq_client: bigquery.Client, df: pd.DataFrame):
+    """
+    Performs a MERGE operation to insert new rows and update existing ones.
+    """
+    if df.empty:
+        logging.info("No data to upsert. Skipping MERGE operation.")
+        return
+
+    # Ensure date columns are in the correct format for BigQuery MERGE
+    for col in ['run_date', 'expiration_date']:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col]).dt.date
+
+    temp_table_id = f"{TRACKER_TABLE_ID}_temp_staging"
+    
+    load_job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
+    bq_client.load_table_from_dataframe(df, temp_table_id, job_config=load_job_config).result()
+
+    merge_sql = f"""
+    MERGE `{TRACKER_TABLE_ID}` T
+    USING `{temp_table_id}` S ON T.contract_symbol = S.contract_symbol
+    WHEN MATCHED THEN
+        UPDATE SET
+            T.current_price = S.current_price,
+            T.percent_gain = S.percent_gain,
+            T.status = S.status,
+            T.last_updated = CURRENT_TIMESTAMP()
+    WHEN NOT MATCHED THEN
+        INSERT (
+            contract_symbol, ticker, run_date, expiration_date, option_type, strike_price,
+            stock_price_trend_signal, setup_quality_signal, initial_price, current_price,
+            percent_gain, status, last_updated
+        ) VALUES (
+            S.contract_symbol, S.ticker, S.run_date, S.expiration_date, S.option_type, S.strike_price,
+            S.stock_price_trend_signal, S.setup_quality_signal, S.initial_price, S.current_price,
+            S.percent_gain, S.status, CURRENT_TIMESTAMP()
+        )
+    """
+    try:
+        merge_job = bq_client.query(merge_sql)
+        merge_job.result()
+        logging.info(f"MERGE complete. {merge_job.num_dml_affected_rows} rows affected in {TRACKER_TABLE_ID}.")
+    finally:
+        bq_client.delete_table(temp_table_id, not_found_ok=True)
+
 
 def run_pipeline():
     """
@@ -94,54 +135,38 @@ def run_pipeline():
     bq_client = bigquery.Client(project=config.SOURCE_PROJECT_ID)
     today = date.today()
 
-    # 1. Identify new winners and find existing active trades
-    new_winners_df, active_winners_df = _get_new_and_active_winners(bq_client)
-    
-    # 2. Prepare today's snapshot for the new winners
-    if not new_winners_df.empty:
-        new_winners_df['recommendation_date'] = today
-        new_winners_df['snapshot_date'] = today
-        new_winners_df['stock_price_snapshot'] = new_winners_df['stock_price_initial']
-        new_winners_df['snapshot_price'] = new_winners_df['initial_price']
-        new_winners_df['status'] = 'Active'
-    
-    # 3. Fetch current prices for the active old winners
-    current_prices_df = _get_current_prices(bq_client, active_winners_df)
-    
-    # 4. Prepare today's snapshot for the active old winners
-    updated_winners_df = pd.DataFrame()
-    if not active_winners_df.empty and not current_prices_df.empty:
-        merged_df = pd.merge(active_winners_df, current_prices_df, on='contract_symbol', how='left')
-        merged_df['snapshot_date'] = today
-        
-        # Check if the contract has expired or if we lost pricing data
-        merged_df['status'] = 'Active'
-        merged_df.loc[pd.to_datetime(merged_df['expiration_date']) < pd.to_datetime(today), 'status'] = 'Expired'
-        merged_df.loc[merged_df['snapshot_price'].isnull(), 'status'] = 'Delisted'
-        
-        updated_winners_df = merged_df
+    new_signals_df, active_contracts_df = _get_new_and_active_contracts(bq_client)
 
-    # 5. Combine all of today's snapshots into one DataFrame
-    final_df = pd.concat([new_winners_df, updated_winners_df], ignore_index=True)
+    if not new_signals_df.empty:
+        initial_prices_df = _get_current_prices(bq_client, new_signals_df)
+        new_signals_df = pd.merge(new_signals_df, initial_prices_df, on='contract_symbol', how='left')
+        new_signals_df.rename(columns={'current_price': 'initial_price'}, inplace=True)
+        new_signals_df['current_price'] = new_signals_df['initial_price']
+        new_signals_df['status'] = 'Active'
+        new_signals_df['percent_gain'] = 0.0
     
+    if not active_contracts_df.empty:
+        current_prices_df = _get_current_prices(bq_client, active_contracts_df)
+        active_contracts_df = pd.merge(active_contracts_df, current_prices_df, on='contract_symbol', how='left')
+
+        active_contracts_df['percent_gain'] = (
+            (active_contracts_df['current_price'] - active_contracts_df['initial_price']) /
+             active_contracts_df['initial_price'] * 100
+        ).where(active_contracts_df['initial_price'] != 0)
+
+        active_contracts_df['status'] = 'Active'
+        active_contracts_df['expiration_date'] = pd.to_datetime(active_contracts_df['expiration_date']).dt.date
+        active_contracts_df.loc[active_contracts_df['expiration_date'] < today, 'status'] = 'Expired'
+        active_contracts_df.loc[active_contracts_df['current_price'].isnull(), 'status'] = 'Delisted'
+
+    final_df = pd.concat([new_signals_df, active_contracts_df], ignore_index=True)
+
     if final_df.empty:
-        logging.info("No new or updated winners to track today.")
+        logging.info("No new or active contracts to update today.")
         logging.info("--- Performance Tracker Update Pipeline Finished ---")
         return
         
-    # 6. Ensure schema matches the destination table
-    final_columns = [
-        "recommendation_date", "snapshot_date", "ticker", "contract_symbol", "option_type",
-        "expiration_date", "strike_price", "stock_price_initial", "stock_price_snapshot",
-        "initial_price", "snapshot_price", "status"
-    ]
-    for col in final_columns:
-        if col not in final_df.columns:
-            final_df[col] = None
-    final_df = final_df[final_columns]
-    
-    # 7. Append today's data to the performance tracker table
-    logging.info(f"Adding {len(final_df)} new performance snapshots to the tracker.")
-    bq.load_df_to_bq(final_df, OUTPUT_TABLE_ID, config.DESTINATION_PROJECT_ID, write_disposition="WRITE_APPEND")
+    logging.info(f"Preparing to upsert {len(final_df)} records into the performance tracker.")
+    _upsert_with_merge(bq_client, final_df)
 
     logging.info("--- Performance Tracker Update Pipeline Finished ---")

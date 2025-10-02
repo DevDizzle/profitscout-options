@@ -6,7 +6,7 @@ from core.pipelines import (
     price_chart_generator,
     data_bundler,
     sync_to_firestore,
-    data_cruncher, 
+    data_cruncher,
     dashboard_generator,
     sync_options_to_firestore,
     sync_calendar_to_firestore,
@@ -15,6 +15,7 @@ from core.pipelines import (
     winners_dashboard_generator,
     performance_tracker_updater,
     sync_options_candidates_to_firestore,
+    sync_performance_tracker_to_firestore,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -100,3 +101,9 @@ def run_sync_options_candidates_to_firestore(request):
     """Syncs the latest options candidates to Firestore."""
     sync_options_candidates_to_firestore.run_pipeline()
     return "Sync options candidates to Firestore pipeline finished.", 200
+
+@functions_framework.http
+def run_sync_performance_tracker_to_firestore(request):
+    """Syncs the performance tracker data to Firestore."""
+    sync_performance_tracker_to_firestore.run_pipeline()
+    return "Sync performance tracker to Firestore pipeline finished.", 200
