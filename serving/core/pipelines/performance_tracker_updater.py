@@ -3,22 +3,24 @@ import logging
 from datetime import date
 import pandas as pd
 from google.cloud import bigquery
-from .. import config, bq
+from .. import config
 
 # --- Configuration ---
 SIGNALS_TABLE_ID = f"{config.SOURCE_PROJECT_ID}.{config.BIGQUERY_DATASET}.options_analysis_signals"
 OPTIONS_CHAIN_TABLE_ID = f"{config.SOURCE_PROJECT_ID}.{config.BIGQUERY_DATASET}.options_chain"
 TRACKER_TABLE_ID = f"{config.SOURCE_PROJECT_ID}.{config.BIGQUERY_DATASET}.performance_tracker"
+WINNERS_TABLE_ID = f"{config.SOURCE_PROJECT_ID}.{config.BIGQUERY_DATASET}.winners_dashboard"
+
 
 def _get_new_and_active_contracts(bq_client: bigquery.Client) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    1. Fetches today's new "Strong" signals that are not already in the tracker.
+    1. Fetches today's new "Strong" signals and enriches them with metadata from the winners_dashboard.
     2. Fetches all contracts currently marked as 'Active' in the tracker.
     """
     today_iso = date.today().isoformat()
 
     # --- THIS IS THE FIX ---
-    # The query now explicitly casts the `run_date` field to a DATE before comparing.
+    # The query now casts run_date in the winners_dashboard table to a DATE as well.
     new_signals_query = f"""
         SELECT
             s.contract_symbol,
@@ -28,8 +30,12 @@ def _get_new_and_active_contracts(bq_client: bigquery.Client) -> tuple[pd.DataFr
             s.option_type,
             s.strike_price,
             s.stock_price_trend_signal,
-            s.setup_quality_signal
+            s.setup_quality_signal,
+            w.company_name,
+            w.industry,
+            w.image_uri
         FROM `{SIGNALS_TABLE_ID}` s
+        JOIN `{WINNERS_TABLE_ID}` w ON s.ticker = w.ticker AND CAST(s.run_date AS DATE) = CAST(w.run_date AS DATE)
         LEFT JOIN `{TRACKER_TABLE_ID}` t ON s.contract_symbol = t.contract_symbol
         WHERE CAST(s.run_date AS DATE) = @today
           AND s.setup_quality_signal = 'Strong'
@@ -57,14 +63,9 @@ def _get_new_and_active_contracts(bq_client: bigquery.Client) -> tuple[pd.DataFr
     return new_signals_df, active_contracts_df
 
 def _get_current_prices(bq_client: bigquery.Client, contracts_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Fetches the latest mid-price for a given list of contract symbols.
-    """
     if contracts_df.empty:
         return pd.DataFrame()
-
     contract_symbols = contracts_df['contract_symbol'].unique().tolist()
-
     query = f"""
         SELECT
             contract_symbol,
@@ -74,30 +75,23 @@ def _get_current_prices(bq_client: bigquery.Client, contracts_df: pd.DataFrame) 
           AND fetch_date = (SELECT MAX(fetch_date) FROM `{OPTIONS_CHAIN_TABLE_ID}`)
           AND bid > 0 AND ask > 0
     """
-
     job_config = bigquery.QueryJobConfig(
         query_parameters=[bigquery.ArrayQueryParameter("contract_symbols", "STRING", contract_symbols)]
     )
-    prices_df = bq_client.query(query, job_config=job_config).to_dataframe()
-    return prices_df
+    return bq_client.query(query, job_config=job_config).to_dataframe()
 
 def _upsert_with_merge(bq_client: bigquery.Client, df: pd.DataFrame):
-    """
-    Performs a MERGE operation to insert new rows and update existing ones.
-    """
     if df.empty:
         logging.info("No data to upsert. Skipping MERGE operation.")
         return
 
-    # Ensure date columns are in the correct format for BigQuery MERGE
     for col in ['run_date', 'expiration_date']:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col]).dt.date
 
     temp_table_id = f"{TRACKER_TABLE_ID}_temp_staging"
-    
-    load_job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
-    bq_client.load_table_from_dataframe(df, temp_table_id, job_config=load_job_config).result()
+    job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
+    bq_client.load_table_from_dataframe(df, temp_table_id, job_config=job_config).result()
 
     merge_sql = f"""
     MERGE `{TRACKER_TABLE_ID}` T
@@ -112,11 +106,13 @@ def _upsert_with_merge(bq_client: bigquery.Client, df: pd.DataFrame):
         INSERT (
             contract_symbol, ticker, run_date, expiration_date, option_type, strike_price,
             stock_price_trend_signal, setup_quality_signal, initial_price, current_price,
-            percent_gain, status, last_updated
+            percent_gain, status, last_updated,
+            company_name, industry, image_uri
         ) VALUES (
             S.contract_symbol, S.ticker, S.run_date, S.expiration_date, S.option_type, S.strike_price,
             S.stock_price_trend_signal, S.setup_quality_signal, S.initial_price, S.current_price,
-            S.percent_gain, S.status, CURRENT_TIMESTAMP()
+            S.percent_gain, S.status, CURRENT_TIMESTAMP(),
+            S.company_name, S.industry, S.image_uri
         )
     """
     try:
@@ -126,11 +122,7 @@ def _upsert_with_merge(bq_client: bigquery.Client, df: pd.DataFrame):
     finally:
         bq_client.delete_table(temp_table_id, not_found_ok=True)
 
-
 def run_pipeline():
-    """
-    Orchestrates the daily update of the performance tracker table.
-    """
     logging.info("--- Starting Performance Tracker Update Pipeline ---")
     bq_client = bigquery.Client(project=config.SOURCE_PROJECT_ID)
     today = date.today()
@@ -144,16 +136,14 @@ def run_pipeline():
         new_signals_df['current_price'] = new_signals_df['initial_price']
         new_signals_df['status'] = 'Active'
         new_signals_df['percent_gain'] = 0.0
-    
+
     if not active_contracts_df.empty:
         current_prices_df = _get_current_prices(bq_client, active_contracts_df)
         active_contracts_df = pd.merge(active_contracts_df, current_prices_df, on='contract_symbol', how='left')
-
         active_contracts_df['percent_gain'] = (
             (active_contracts_df['current_price'] - active_contracts_df['initial_price']) /
              active_contracts_df['initial_price'] * 100
         ).where(active_contracts_df['initial_price'] != 0)
-
         active_contracts_df['status'] = 'Active'
         active_contracts_df['expiration_date'] = pd.to_datetime(active_contracts_df['expiration_date']).dt.date
         active_contracts_df.loc[active_contracts_df['expiration_date'] < today, 'status'] = 'Expired'
@@ -163,10 +153,8 @@ def run_pipeline():
 
     if final_df.empty:
         logging.info("No new or active contracts to update today.")
-        logging.info("--- Performance Tracker Update Pipeline Finished ---")
-        return
-        
-    logging.info(f"Preparing to upsert {len(final_df)} records into the performance tracker.")
-    _upsert_with_merge(bq_client, final_df)
+    else:
+        logging.info(f"Preparing to upsert {len(final_df)} records into the performance tracker.")
+        _upsert_with_merge(bq_client, final_df)
 
     logging.info("--- Performance Tracker Update Pipeline Finished ---")
